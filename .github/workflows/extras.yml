@@ -1,0 +1,181 @@
+name: extras
+
+on:
+  schedule:
+    - cron: "0 6 * * *"        # daily: real CISA exploited-vulnerability briefing -> news channel
+    - cron: "30 */5 * * *"     # ~5x/day: intercepted transmission puzzle -> logs channel
+    - cron: "0 0 * * *"        # daily: threat board -> logs channel
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which module to run now"
+        type: choice
+        options: [kev, intercept, board]
+        default: kev
+
+permissions:
+  actions: write                # lets it delete its own old runs
+
+concurrency:
+  group: extras
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Run module
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_LOGS_WEBHOOK_URL: ${{ secrets.DISCORD_LOGS_WEBHOOK_URL }}
+          MODE: ${{ inputs.mode }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, re, json, time, base64, codecs, random, textwrap, datetime as dt
+          import urllib.request, urllib.error
+
+          NEWS_HOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+          LOGS_HOOK = os.environ.get("DISCORD_LOGS_WEBHOOK_URL", "")
+          SCHEDULE_MODES = {"0 6 * * *": "kev", "30 */5 * * *": "intercept", "0 0 * * *": "board"}
+          manual = bool(os.environ.get("MODE"))
+          mode = os.environ.get("MODE") or SCHEDULE_MODES.get(os.environ.get("EVENT_SCHEDULE", ""), "")
+          if mode not in ("kev", "intercept", "board"):
+              sys.exit("Unknown mode: " + repr(mode))
+
+          RST = "\u001b[0m"
+          RED, GRN, YEL, CYN, MAG, DIM, WHT = "1;31", "1;32", "1;33", "0;36", "0;35", "1;30", "1;37"
+
+          def col(code, s):
+              return "\u001b[" + code + "m" + str(s) + RST
+
+          def post(hook, username, content):
+              if not hook:
+                  sys.exit("Missing webhook secret for mode " + mode)
+              payload = {"username": username, "content": content[:1950], "allowed_mentions": {"parse": []}}
+              for i in range(3):
+                  try:
+                      req = urllib.request.Request(hook, data=json.dumps(payload).encode(),
+                                                   headers={"Content-Type": "application/json", "User-Agent": "ghost-extras"})
+                      urllib.request.urlopen(req, timeout=30)
+                      return
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 500, 502, 503) and i < 2:
+                          time.sleep(5 * (i + 1))
+                          continue
+                      sys.exit("Discord webhook error HTTP " + str(e.code))
+                  except Exception:
+                      if i < 2:
+                          time.sleep(5)
+                          continue
+                      sys.exit("Cannot reach Discord")
+
+          def block(lines):
+              return "```ansi\n" + "\n".join(lines) + "\n```"
+
+          # ---------------------------------------------------------------- 1. real: CISA KEV
+          def kev():
+              url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; ghost-extras)"})
+                  with urllib.request.urlopen(req, timeout=40) as r:
+                      vulns = json.load(r).get("vulnerabilities", [])
+              except Exception:
+                  sys.exit("Could not fetch the CISA KEV catalog")
+              vulns.sort(key=lambda v: (v.get("dateAdded", ""), v.get("cveID", "")), reverse=True)
+              yday = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)).isoformat()
+              if manual:
+                  pick, label = vulns[:3], "latest additions"
+              else:
+                  pick, label = [v for v in vulns if v.get("dateAdded") == yday], yday   # each entry posted once
+              if not pick:
+                  print("no new KEV entries for", yday, "- staying quiet")
+                  return
+              lines = [col(RED, "[!] CISA KEV") + " // actively exploited vulnerabilities // " + label, ""]
+              shown = 0
+              for v in pick[:6]:
+                  ransom = str(v.get("knownRansomwareCampaignUse", "Unknown"))
+                  entry = [col(YEL, v.get("cveID", "CVE-?")) + "  " + col(WHT, (v.get("vendorProject", "") + " " + v.get("product", "")).strip())[:90],
+                           "  " + v.get("vulnerabilityName", "")[:110],
+                           "  added " + v.get("dateAdded", "?") + " | due " + v.get("dueDate", "?") + " | ransomware: "
+                           + (col(RED, "KNOWN") if ransom.lower() == "known" else col(DIM, ransom.lower()))]
+                  entry += ["  " + col(DIM, l) for l in textwrap.wrap("fix: " + v.get("requiredAction", ""), 78)[:3]]
+                  entry.append("")
+                  if len("\n".join(lines + entry)) > 1650:
+                      break
+                  lines += entry
+                  shown += 1
+              if len(pick) > shown:
+                  lines.append(col(DIM, "+" + str(len(pick) - shown) + " more in the catalog"))
+              msg = block(lines) + "\n-# source: CISA Known Exploited Vulnerabilities catalog, https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+              post(NEWS_HOOK, "cisa_courier", msg)
+              print("posted", shown, "KEV entries")
+
+          # ---------------------------------------------------------------- 2. fun: intercepted transmissions
+          LINES = [
+              "the signal is the noise", "all nodes dark at 0300 proceed with phase two",
+              "they rotated the keys but we are already inside", "trust the mesh not the wire",
+              "ghost protocol is live", "the vault opens at moonrise", "echo sees everything and says nothing",
+              "dead drop moved to sector nine", "patience is just a slow zero day", "watch the watchers",
+              "the cipher is older than the network", "ping the void and it pings back",
+              "root is a state of mind", "burn the logs keep the map", "midnight handshake confirmed",
+              "the firewall is only a suggestion", "whoever reads this is already late",
+              "nothing real was harmed in the making of this noise", "sector four is listening",
+              "if you can read this you are part of the mesh",
+          ]
+
+          def intercept():
+              text = random.choice(LINES)
+              kind = random.choice(["base64", "hex", "rot13", "reversed"])
+              if kind == "base64":
+                  payload = base64.b64encode(text.encode()).decode()
+              elif kind == "hex":
+                  payload = text.encode().hex()
+              elif kind == "rot13":
+                  payload = codecs.encode(text, "rot13")
+              else:
+                  payload = text[::-1]
+              lines = [col(MAG, "[INTERCEPT]") + " freq " + "%.1f" % random.uniform(87.5, 108.0) + "MHz | burst "
+                       + "%.2f" % random.uniform(0.1, 2.4) + "s | origin sector-" + str(random.randint(1, 9)),
+                       col(DIM, "encoding: ") + col(YEL, kind), ""]
+              lines += textwrap.wrap(payload, 64) if " " not in payload else textwrap.wrap(payload, 64)
+              msg = block(lines) + "\n-# decode it. still stuck? ||" + text + "||"
+              post(LOGS_HOOK, "intercept_daemon", msg)
+              print("posted intercept,", kind)
+
+          # ---------------------------------------------------------------- 3. fun: daily threat board
+          def bar(p, width=18):
+              n = int(width * p / 100)
+              return "\u2588" * n + "\u2591" * (width - n)
+
+          def board():
+              name, c = random.choices([("LOW", GRN), ("GUARDED", CYN), ("ELEVATED", YEL), ("HIGH", RED), ("SEVERE", "1;35")],
+                                       weights=[2, 4, 4, 3, 1])[0]
+              day = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+              rows = ["intrusion attempts", "malware signatures", "phishing waves", "data exfil probes", "zero-day chatter"]
+              lines = [col(DIM, "=" * 46), "  DAILY THREAT BOARD  " + col(DIM, day) + "   level: " + col(c, name), col(DIM, "=" * 46)]
+              for r in rows:
+                  p = random.randint(8, 97)
+                  lines.append("  " + r.ljust(19) + col(c if p > 70 else CYN, bar(p)) + " " + str(random.randint(20, 9000)).rjust(5))
+              lines += [col(DIM, "-" * 46),
+                        "  most active   : sector-" + str(random.randint(1, 9)),
+                        "  mean detect   : " + str(random.randint(2, 90)) + "s | nodes online " + str(random.randint(9, 12)) + "/12",
+                        "  contained     : " + str(random.randint(30, 4000)) + " | open cases " + str(random.randint(0, 14)),
+                        col(DIM, "=" * 46)]
+              post(LOGS_HOOK, "threat_monitor", block(lines))
+              print("posted board,", name)
+
+          {"kev": kev, "intercept": intercept, "board": board}[mode]()
+          PY
+
+      - name: Delete old runs of this workflow (keep newest 5)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/extras.yml/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | .id' \
+            | tail -n +6 \
+            | xargs -r -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/{}" \
+            || true
