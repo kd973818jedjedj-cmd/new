@@ -266,7 +266,7 @@ jobs:
               for tool in variants:                      # None = plain call without any tool
                   try:
                       data = post_json(url, dict(body, tools=[tool]) if tool else body,
-                                       headers={"x-goog-api-key": KEY}, timeout=75,
+                                       headers={"x-goog-api-key": KEY}, timeout=60,
                                        retries=2, show_msg=True)
                   except ApiError as e:
                       if e.code == 400 and re.search(r"tool|search|ground", str(e), re.I):
@@ -284,7 +284,7 @@ jobs:
               raise last or ApiError(-1, "no request variant worked")
 
 
-          def run_rounds(body, variants, suffix, errors):
+          def run_rounds(body, variants, suffix, errors, until):
               """Try models in rounds until one passes its live test -> (text, cand, model) or None.
               Round 0: healthy models only. Later rounds: never lazy, retry everything that could
               still work. Models with no quota left today (or no access) are not hammered again."""
@@ -296,9 +296,11 @@ jobs:
                           continue
                       break
                   if rnd:
+                      if time.monotonic() + 20 * rnd > until:
+                          break
                       time.sleep(20 * rnd)
                   for m in todo:
-                      if time.monotonic() > DEADLINE:
+                      if time.monotonic() > until:
                           return None
                       try:
                           text, cand = attempt(m, body, variants)
@@ -345,17 +347,31 @@ jobs:
 
 
           def finish_feed_text(text, items):
-              """Turn 'Source: <url>' lines into clean source links; drop any link not in the feeds."""
+              """Keep ONLY stories that cite a real feed link. Anything without one is dropped,
+              so a hallucinated story can never reach Discord. Returns (text, sources)."""
               by_link = {it["link"]: it["outlet"] for it in items}
-              sources, used = [], set()
-              for u in re.findall(r"https?://[^\s)\]>*]+", text):
-                  u = u.rstrip(".,;")
-                  if u in by_link and by_link[u] not in used:
-                      used.add(by_link[u])
-                      sources.append(f"[{by_link[u]}]({u})")
-              text = re.sub(r"(?m)^[ \t]*-?[ \t]*\**Source\**:.*\n?", "", text)
-              text = re.sub(r"https?://\S+", "", text)           # stray (maybe invented) links
-              return text.strip(), sources[:5]
+              blocks = re.split(r"(?m)^(?=\**\[\d+\])", text)
+              kept, sources, used = [], [], set()
+              for blk in blocks:
+                  if not re.match(r"\**\[\d+\]", blk):
+                      continue                                   # preamble or chatter
+                  good = [u.rstrip(".,;") for u in re.findall(r"https?://[^\s)\]>*]+", blk)
+                          if u.rstrip(".,;") in by_link]
+                  if not good:
+                      continue                                   # no real source -> story dropped
+                  outlet, url = by_link[good[0]], good[0]
+                  if outlet not in used:
+                      used.add(outlet)
+                      sources.append(f"[{outlet}]({url})")
+                  blk = re.sub(r"(?m)^[ \t]*[-*]?[ \t]*\**Source\**:.*\n?", "", blk)
+                  blk = re.sub(r"https?://\S+", "", blk).strip()
+                  kept.append(blk)
+              if not kept:
+                  return "NO_SIGNAL", []
+              out = [re.sub(r"^\**\[\d+\]", f"**[{i}]", blk, count=1) for i, blk in enumerate(kept, 1)]
+              out = [b_ if re.match(r"\*\*\[\d+\][^\n]*\*\*", b_) else re.sub(r"^(\*\*\[\d+\][^\n]*)", r"\1**", b_, count=1)
+                     for b_ in out]
+              return "\n\n".join(out), sources[:5]
 
 
           def summarize(errors, n_items):
@@ -391,6 +407,9 @@ jobs:
                   "- Impact: 1 sentence on the consequence or the lesson.\n"
               )
               big = (
+                  "PEOPLE RULE: never state an allegation (crime, affair, scandal, resignation, firing) about a "
+                  "real named person unless a cited headline says it explicitly. Never merge facts from "
+                  "different headlines into one story.\n\n"
                   "SIGNIFICANCE FILTER: only pick stories that are truly big, meeting at least one of: "
                   "(a) involves a very famous company or organization, "
                   "(b) affects millions of people or causes huge damage, "
@@ -409,7 +428,8 @@ jobs:
                   "Never speculate and never add details the sources do not state.\n\n"
                   + style + "\nNo greeting and no closing remarks." + avoid
               )
-              res = run_rounds({"contents": [{"parts": [{"text": prompt}]}]}, TOOL_VARIANTS, "", errors)
+              res = run_rounds({"contents": [{"parts": [{"text": prompt}]}]}, TOOL_VARIANTS, "", errors,
+                               until=min(DEADLINE, time.monotonic() + 150))   # search mode gets 2.5 min max
               if res:
                   text, cand, m = res
                   sources, names = [], set()
@@ -437,10 +457,11 @@ jobs:
                       "USE ONLY THE LISTED HEADLINES. Never add facts that are not in the list. Prefer stories "
                       "that several outlets in the list report. If a story is not confirmed by the headline text, "
                       "say so.\n\n" + style +
-                      "- Source: copy ONE url exactly as given in the list.\n\n"
+                      "- Source: copy the ONE url of the headline this story is based on, exactly as given. "
+                      "A story without a valid Source url is discarded.\n\n"
                       "No greeting and no closing remarks." + avoid
                   )
-                  res = run_rounds({"contents": [{"parts": [{"text": prompt}]}]}, [None], "|feeds", errors)
+                  res = run_rounds({"contents": [{"parts": [{"text": prompt}]}]}, [None], "|feeds", errors, until=DEADLINE)
                   if res:
                       text, cand, m = res
                       text, sources = finish_feed_text(text, items)
