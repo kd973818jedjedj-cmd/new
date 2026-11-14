@@ -32,6 +32,7 @@ jobs:
           python - <<'PY'
           import os, re, json, random, time, datetime as dt
           import urllib.request, urllib.error
+          import xml.etree.ElementTree as ET
           from urllib.parse import urlparse
 
           KEY = os.environ["GEMINI_API_KEY"]
@@ -40,7 +41,8 @@ jobs:
           SEEN_FILE, SEEN_MAX = "seen.json", 60
           HEALTH_FILE = "model_health.json"
           DEADLINE = time.monotonic() + 9 * 60             # hard time budget for the whole run
-          FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
+          # Google-maintained aliases that always point at a current model
+          FALLBACK_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]
           MAX_TRIES = 10
           # If one grounding tool format is rejected, the bot heals itself by trying the other.
           TOOL_VARIANTS = [{"google_search": {}}, {"google_search_retrieval": {}}]
@@ -61,6 +63,24 @@ jobs:
               "hardware, chips and GPUs",
               "open source and developer tools",
           ]
+
+
+          FEEDS = {
+              "hack": [
+                  ("BleepingComputer", "https://www.bleepingcomputer.com/feed/"),
+                  ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews"),
+                  ("Krebs on Security", "https://krebsonsecurity.com/feed/"),
+                  ("SecurityWeek", "https://www.securityweek.com/feed/"),
+                  ("The Record", "https://therecord.media/feed"),
+              ],
+              "news": [
+                  ("TechCrunch", "https://techcrunch.com/feed/"),
+                  ("The Verge", "https://www.theverge.com/rss/index.xml"),
+                  ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+                  ("Wired", "https://www.wired.com/feed/rss"),
+                  ("Hacker News", "https://hnrss.org/frontpage?points=300"),
+              ],
+          }
 
 
           def pick_topic():
@@ -227,25 +247,25 @@ jobs:
               return len(t) > 120 and re.search(r"\*\*\[\d+\]", t) is not None
 
 
-          def attempt(model, body):
+          def attempt(model, body, variants):
               """Like _attempt, but if Google says 'slow down for N seconds', wait once and retry."""
               try:
-                  return _attempt(model, body)
+                  return _attempt(model, body, variants)
               except ApiError as e:
                   if (e.code == 429 and e.scope not in ("day", "zero") and e.retry and e.retry <= 45
                           and time.monotonic() + e.retry + 90 < DEADLINE):
                       time.sleep(e.retry + 1)
-                      return _attempt(model, body)
+                      return _attempt(model, body, variants)
                   raise
 
 
-          def _attempt(model, body):
+          def _attempt(model, body, variants):
               """One real call = one live test of this model. Raises ApiError on any problem."""
               url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
               last = None
-              for tool in TOOL_VARIANTS:
+              for tool in variants:                      # None = plain call without any tool
                   try:
-                      data = post_json(url, dict(body, tools=[tool]),
+                      data = post_json(url, dict(body, tools=[tool]) if tool else body,
                                        headers={"x-goog-api-key": KEY}, timeout=75,
                                        retries=2, show_msg=True)
                   except ApiError as e:
@@ -261,47 +281,16 @@ jobs:
                   if not valid(text):
                       raise ApiError(-2, "output failed format check")
                   return text, cands[0]
-              raise last
+              raise last or ApiError(-1, "no request variant worked")
 
 
-          def ask_gemini(topic, seen):
-              today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-              avoid = ""
-              if seen:
-                  avoid = ("\nALREADY POSTED, DO NOT REPEAT THESE STORIES:\n- "
-                           + "\n- ".join(seen[-30:]) + "\n")
-              prompt = (
-                  f"Today is {today}. Search the web for the MOST RECENT news (last few days) about: {topic}.\n\n"
-                  "SIGNIFICANCE FILTER: only pick stories that are truly big, meeting at least one of: "
-                  "(a) involves a very famous company or organization, "
-                  "(b) affects millions of people or causes huge damage, "
-                  "(c) is making waves, covered by many major outlets at once. "
-                  "Skip minor stories and anything backed only by a single small blog. "
-                  "Return at most 3 stories, biggest first. Fewer than 3 is fine, never pad the list. "
-                  "If NOTHING qualifies, reply with exactly one word: NO_SIGNAL\n\n"
-                  "ANTI-HALLUCINATION: every story must be confirmed by at least 2 reputable outlets. "
-                  "If something is only a rumor or unconfirmed, label it 'UNCONFIRMED' or skip it. "
-                  "Never speculate and never add details the sources do not state.\n\n"
-                  "OUTPUT LANGUAGE: write in English, in the voice of a cool cyber-intelligence news channel, "
-                  "but stay factually accurate. Use exactly this format for each story:\n"
-                  "**[number] Victim or event name**\n"
-                  "- Severity: \U0001F534 CRITICAL or \U0001F7E0 HIGH or \U0001F7E1 NOTABLE\n"
-                  "- What happened: 1-2 sentences with scale (people, money, records, downtime) if known.\n"
-                  "- How it happened: 1-2 sentences, only at the level the sources have publicly reported. "
-                  "No exploit code, payloads or reproduction steps. If unknown, say it is under investigation. "
-                  "For non-hack stories, replace this line with 'Context'.\n"
-                  "- Impact: 1 sentence on the consequence or the lesson.\n\n"
-                  "No greeting and no closing remarks."
-                  f"{avoid}"
-              )
-              body = {"contents": [{"parts": [{"text": prompt}]}]}
-
-              errors, dead = {}, set()
-              # Round 0: healthy models only. Round 1+: never lazy, retry everything that could
-              # still work (cooldowns ignored), wait between rounds in case of a short outage.
-              # Models with no quota left today (or no access) are not hammered again this run.
+          def run_rounds(body, variants, suffix, errors):
+              """Try models in rounds until one passes its live test -> (text, cand, model) or None.
+              Round 0: healthy models only. Later rounds: never lazy, retry everything that could
+              still work. Models with no quota left today (or no access) are not hammered again."""
+              dead = set()
               for rnd in range(3):
-                  todo = [m for m in pick_models() if m not in dead and (rnd > 0 or not cooling(m))]
+                  todo = [m for m in pick_models() if m not in dead and (rnd > 0 or not cooling(m + suffix))]
                   if not todo:
                       if rnd == 0:
                           continue
@@ -310,29 +299,153 @@ jobs:
                       time.sleep(20 * rnd)
                   for m in todo:
                       if time.monotonic() > DEADLINE:
-                          raise RuntimeError("Out of time. " + " | ".join(f"{k}: {v}" for k, v in errors.items()))
+                          return None
                       try:
-                          text, cand = attempt(m, body)
+                          text, cand = attempt(m, body, variants)
                       except ApiError as e:
-                          mark_fail(m, e)
-                          errors[m] = str(e)
-                          if e.code in (403, 404) or e.scope in ("day", "zero"):
+                          mark_fail(m + suffix, e)
+                          errors[m + suffix] = str(e)
+                          if e.code in (403, 404, 429):      # 429 already got its one polite retry
                               dead.add(m)
                           continue
-                      mark_ok(m)
-                      sources, names = [], set()
-                      for c in cand.get("groundingMetadata", {}).get("groundingChunks", []):
-                          web = c.get("web")
-                          if not web or not web.get("uri"):
-                              continue
-                          name = web.get("title") or urlparse(web["uri"]).netloc
-                          if name in names:
-                              continue
-                          names.add(name)
-                          sources.append(f"[{name}]({web['uri']})")
-                      titles = re.findall(r"\*\*\[\d+\]\s*(.+?)\*\*", text)
-                      return text, sources[:5], titles, m
-              raise RuntimeError("All models failed: " + " | ".join(f"{k}: {v}" for k, v in errors.items()))
+                      mark_ok(m + suffix)
+                      return text, cand, m
+              return None
+
+
+          def fetch_feeds(kind):
+              """Plan B news source: real headlines from RSS/Atom feeds (no Gemini quota needed)."""
+              items = []
+              for outlet, url in FEEDS["hack" if kind == "hack" else "news"]:
+                  if time.monotonic() > DEADLINE:
+                      break
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; gemini-discord-bot)"})
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          root = ET.fromstring(r.read())
+                  except Exception:
+                      continue
+                  atom = "{http://www.w3.org/2005/Atom}"
+                  n = 0
+                  for it in list(root.iter("item")) + list(root.iter(atom + "entry")):
+                      title = (it.findtext("title") or it.findtext(atom + "title") or "").strip()
+                      link = (it.findtext("link") or "").strip()
+                      if not link:
+                          a = it.find(atom + "link")
+                          link = a.get("href", "") if a is not None else ""
+                      date = (it.findtext("pubDate") or it.findtext(atom + "updated") or "").strip()
+                      desc = it.findtext("description") or it.findtext(atom + "summary") or ""
+                      desc = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", desc)).strip()[:160]
+                      if title and link.startswith("http"):
+                          items.append({"outlet": outlet, "title": title, "link": link, "date": date, "desc": desc})
+                          n += 1
+                          if n >= 12:
+                              break
+              return items[:70]
+
+
+          def finish_feed_text(text, items):
+              """Turn 'Source: <url>' lines into clean source links; drop any link not in the feeds."""
+              by_link = {it["link"]: it["outlet"] for it in items}
+              sources, used = [], set()
+              for u in re.findall(r"https?://[^\s)\]>*]+", text):
+                  u = u.rstrip(".,;")
+                  if u in by_link and by_link[u] not in used:
+                      used.add(by_link[u])
+                      sources.append(f"[{by_link[u]}]({u})")
+              text = re.sub(r"(?m)^[ \t]*-?[ \t]*\**Source\**:.*\n?", "", text)
+              text = re.sub(r"https?://\S+", "", text)           # stray (maybe invented) links
+              return text.strip(), sources[:5]
+
+
+          def summarize(errors, n_items):
+              groups = {}
+              for k, v in errors.items():
+                  v = re.sub(r"HTTP (\d+) from [\w.]+:? ?", r"HTTP \1 ", v)
+                  groups.setdefault(v[:120], []).append(k)
+              out = " | ".join(f"{len(ks)}x {msg} (e.g. {ks[0]})" for msg, ks in groups.items())
+              plain429 = any(k.endswith("|feeds") and "429" in v for k, v in errors.items())
+              if plain429:
+                  out += (" || HINT: 429 even WITHOUT Google Search means this API key/project has no usable "
+                          "quota: enable billing in AI Studio or create a key in a new project.")
+              elif n_items == 0:
+                  out += " || NOTE: news feeds were unreachable too."
+              return out
+
+
+          def ask_gemini(topic, kind, seen):
+              today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+              avoid = ""
+              if seen:
+                  avoid = ("\nALREADY POSTED, DO NOT REPEAT THESE STORIES:\n- "
+                           + "\n- ".join(seen[-30:]) + "\n")
+              style = (
+                  "OUTPUT LANGUAGE: write in English, in the voice of a cool cyber-intelligence news channel, "
+                  "but stay factually accurate. Use exactly this format for each story:\n"
+                  "**[number] Victim or event name**\n"
+                  "- Severity: \U0001F534 CRITICAL or \U0001F7E0 HIGH or \U0001F7E1 NOTABLE\n"
+                  "- What happened: 1-2 sentences with scale (people, money, records, downtime) if known.\n"
+                  "- How it happened: 1-2 sentences, only at the level the sources have publicly reported. "
+                  "No exploit code, payloads or reproduction steps. If unknown, say it is under investigation. "
+                  "For non-hack stories, replace this line with 'Context'.\n"
+                  "- Impact: 1 sentence on the consequence or the lesson.\n"
+              )
+              big = (
+                  "SIGNIFICANCE FILTER: only pick stories that are truly big, meeting at least one of: "
+                  "(a) involves a very famous company or organization, "
+                  "(b) affects millions of people or causes huge damage, "
+                  "(c) is making waves, covered by many major outlets at once. "
+                  "Skip minor stories. Return at most 3 stories, biggest first. Fewer than 3 is fine, "
+                  "never pad the list. If NOTHING qualifies, reply with exactly one word: NO_SIGNAL\n\n"
+              )
+              errors = {}
+
+              # Mode 1: Gemini searches the web itself (Google Search grounding).
+              prompt = (
+                  f"Today is {today}. Search the web for the MOST RECENT news (last few days) about: {topic}.\n\n"
+                  + big +
+                  "ANTI-HALLUCINATION: every story must be confirmed by at least 2 reputable outlets. "
+                  "If something is only a rumor or unconfirmed, label it 'UNCONFIRMED' or skip it. "
+                  "Never speculate and never add details the sources do not state.\n\n"
+                  + style + "\nNo greeting and no closing remarks." + avoid
+              )
+              res = run_rounds({"contents": [{"parts": [{"text": prompt}]}]}, TOOL_VARIANTS, "", errors)
+              if res:
+                  text, cand, m = res
+                  sources, names = [], set()
+                  for c in cand.get("groundingMetadata", {}).get("groundingChunks", []):
+                      web = c.get("web")
+                      if not web or not web.get("uri"):
+                          continue
+                      name = web.get("title") or urlparse(web["uri"]).netloc
+                      if name in names:
+                          continue
+                      names.add(name)
+                      sources.append(f"[{name}]({web['uri']})")
+                  return text, sources[:5], re.findall(r"\*\*\[\d+\]\s*(.+?)\*\*", text), m
+
+              # Mode 2: we fetch real headlines from RSS feeds, Gemini only picks and writes.
+              # Needs no search grounding, so it works when the search quota is the problem.
+              items = fetch_feeds(kind)
+              if items:
+                  lines = "\n".join(f"- {i['outlet']} | {i['date']} | {i['title']} | {i['desc']} | {i['link']}"
+                                    for i in items)
+                  prompt = (
+                      f"Today is {today}. Below are the latest headlines fetched from news feeds, one per line "
+                      f"as: outlet | date | title | summary | url.\n\n{lines}\n\n"
+                      f"Topic: {topic}.\n\n" + big +
+                      "USE ONLY THE LISTED HEADLINES. Never add facts that are not in the list. Prefer stories "
+                      "that several outlets in the list report. If a story is not confirmed by the headline text, "
+                      "say so.\n\n" + style +
+                      "- Source: copy ONE url exactly as given in the list.\n\n"
+                      "No greeting and no closing remarks." + avoid
+                  )
+                  res = run_rounds({"contents": [{"parts": [{"text": prompt}]}]}, [None], "|feeds", errors)
+                  if res:
+                      text, cand, m = res
+                      text, sources = finish_feed_text(text, items)
+                      return text, sources, re.findall(r"\*\*\[\d+\]\s*(.+?)\*\*", text), m + " + feeds"
+              raise RuntimeError(summarize(errors, len(items)))
 
 
           # ---------------------------------------------------------------- discord
@@ -395,7 +508,7 @@ jobs:
               seen = load_json(SEEN_FILE, [])
               topic, kind = pick_topic()
               try:
-                  text, sources, titles, model = ask_gemini(topic, seen)
+                  text, sources, titles, model = ask_gemini(topic, kind, seen)
               finally:
                   save_json(HEALTH_FILE, health)       # remember what worked, even after a failure
               if text.strip().upper().startswith("NO_SIGNAL"):
