@@ -6,7 +6,7 @@ on:
   workflow_dispatch:            # manual run button in the Actions tab
 
 permissions:
-  contents: write               # lets the bot commit seen.json
+  contents: write               # lets the bot commit its state files
 
 concurrency:
   group: gemini-ping
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +35,14 @@ jobs:
 
           KEY = os.environ["GEMINI_API_KEY"]
           HOOK = os.environ["DISCORD_WEBHOOK_URL"]
-          MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+          PINNED = os.environ.get("GEMINI_MODEL", "")      # optional: force one model first
           SEEN_FILE, SEEN_MAX = "seen.json", 60
+          HEALTH_FILE = "model_health.json"
+          DEADLINE = time.monotonic() + 9 * 60             # hard time budget for the whole run
+          FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
+          MAX_TRIES = 8
+          # If one grounding tool format is rejected, the bot heals itself by trying the other.
+          TOOL_VARIANTS = [{"google_search": {}}, {"google_search_retrieval": {}}]
 
           HACK_TOPICS = [
               "the biggest cyberattacks and data breaches hitting famous corporations, governments or critical infrastructure",
@@ -55,6 +61,7 @@ jobs:
               "open source and developer tools",
           ]
 
+
           def pick_topic():
               r = random.random()
               if r < 0.55:
@@ -63,11 +70,21 @@ jobs:
                   return random.choice(BREAKING_TOPICS), "breaking"
               return random.choice(TECH_TOPICS), "tech"
 
-          def post_json(url, body, headers=None, timeout=60, retries=3):
+
+          # ---------------------------------------------------------------- http
+          class ApiError(Exception):
+              """code: HTTP status, 0 = network, -1 = empty answer, -2 = failed format check"""
+              def __init__(self, code, msg):
+                  super().__init__(msg)
+                  self.code = code
+
+
+          def post_json(url, body, headers=None, timeout=60, retries=3,
+                        retry_on=(500, 502, 503, 504), show_msg=False):
               data = json.dumps(body).encode()
               h = {"Content-Type": "application/json", "User-Agent": "gemini-discord-bot"}
               h.update(headers or {})
-              host = urlparse(url).netloc   # log hostname only, never the full URL
+              host = urlparse(url).netloc          # log the hostname only, never the full URL
               for i in range(retries):
                   try:
                       req = urllib.request.Request(url, data=data, headers=h)
@@ -75,26 +92,129 @@ jobs:
                           raw = r.read()
                           return json.loads(raw) if raw else {}
                   except urllib.error.HTTPError as e:
-                      if e.code in (429, 500, 502, 503, 504) and i < retries - 1:
-                          time.sleep(5 * 2 ** i)
+                      msg = ""
+                      if show_msg:                  # Google's error text helps self-diagnosis
+                          try:
+                              msg = str(json.load(e).get("error", {}).get("message", ""))[:200]
+                          except Exception:
+                              pass
+                      if e.code in retry_on and i < retries - 1:
+                          wait = 5 * 2 ** i
+                          ra = e.headers.get("Retry-After") if e.headers else None
+                          if ra and ra.isdigit():
+                              wait = min(int(ra), 30)
+                          time.sleep(wait)
                           continue
-                      raise RuntimeError(f"HTTP {e.code} from {host}") from None
-                  except (urllib.error.URLError, TimeoutError):
+                      raise ApiError(e.code, f"HTTP {e.code} from {host}" + (f": {msg}" if msg else "")) from None
+                  except (urllib.error.URLError, TimeoutError, OSError):
                       if i < retries - 1:
                           time.sleep(5 * 2 ** i)
                           continue
-                      raise RuntimeError(f"Cannot reach {host}") from None
+                      raise ApiError(0, f"Cannot reach {host}") from None
+                  except ValueError:
+                      raise ApiError(0, f"Bad JSON from {host}") from None
 
-          def load_seen():
+
+          # ---------------------------------------------------------------- state
+          def load_json(path, default):
               try:
-                  with open(SEEN_FILE, encoding="utf-8") as f:
-                      return json.load(f)
+                  with open(path, encoding="utf-8") as f:
+                      v = json.load(f)
+                  return v if isinstance(v, type(default)) else default
               except (FileNotFoundError, json.JSONDecodeError):
-                  return []
+                  return default
 
-          def save_seen(seen):
-              with open(SEEN_FILE, "w", encoding="utf-8") as f:
-                  json.dump(seen[-SEEN_MAX:], f, ensure_ascii=False, indent=1)
+
+          def save_json(path, obj):
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(obj, f, ensure_ascii=False, indent=1)
+
+
+          health = load_json(HEALTH_FILE, {})   # model -> {fails, until, ok, last_error}
+
+
+          def cooling(name):
+              return health.get(name, {}).get("until", 0) > time.time()
+
+
+          def mark_ok(name):
+              health[name] = {"fails": 0, "until": 0, "ok": int(time.time()), "last_error": ""}
+
+
+          def mark_fail(name, err):
+              fails = min(health.get(name, {}).get("fails", 0) + 1, 10)
+              if err.code == 429:
+                  hours = 1                          # quota: try again soon
+              elif err.code in (403, 404):
+                  hours = 48                         # model not available to this key
+              elif err.code in (400, -1, -2):
+                  hours = min(2 ** fails, 48)        # broken for us: back off, then retest
+              else:
+                  hours = 0.25                       # 5xx / network: probably transient
+              health[name] = {"fails": fails, "until": int(time.time() + hours * 3600),
+                              "ok": health.get(name, {}).get("ok", 0), "last_error": str(err)[:120]}
+
+
+          # ---------------------------------------------------------------- gemini
+          def pick_models():
+              """Ask Google which models exist right now. Order: newest flash, then newest
+              flash-lite, then newest pro, then a hardcoded safety net."""
+              found = []
+              try:
+                  req = urllib.request.Request(
+                      "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+                      headers={"x-goog-api-key": KEY, "User-Agent": "gemini-discord-bot"},
+                  )
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      listing = json.load(r)
+                  tier = {"flash": 0, "flash-lite": 1, "pro": 2}
+                  for m in listing.get("models", []):
+                      name = m.get("name", "").removeprefix("models/")
+                      if "generateContent" not in m.get("supportedGenerationMethods", []):
+                          continue
+                      mt = re.fullmatch(r"gemini-(\d+(?:\.\d+)?)-(flash-lite|flash|pro)", name)
+                      if not mt or float(mt.group(1)) < 2.0:      # need Google Search grounding
+                          continue
+                      found.append((tier[mt.group(2)], -float(mt.group(1)), name))
+              except Exception:
+                  pass                                            # listing failed: use safety net
+              found.sort()
+              ordered = ([PINNED] if PINNED else []) + [n for _, _, n in found] + FALLBACK_MODELS
+              return list(dict.fromkeys(ordered))[:MAX_TRIES]
+
+
+          def valid(text):
+              """Self-test of the model output before we trust it."""
+              t = text.strip()
+              if t.upper().startswith("NO_SIGNAL"):
+                  return True
+              return len(t) > 120 and re.search(r"\*\*\[\d+\]", t) is not None
+
+
+          def attempt(model, body):
+              """One real call = one live test of this model. Raises ApiError on any problem."""
+              url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+              last = None
+              for tool in TOOL_VARIANTS:
+                  try:
+                      data = post_json(url, dict(body, tools=[tool]),
+                                       headers={"x-goog-api-key": KEY}, timeout=75,
+                                       retries=2, show_msg=True)
+                  except ApiError as e:
+                      if e.code == 400 and re.search(r"tool|search|ground", str(e), re.I):
+                          last = e                                # heal: try the other tool format
+                          continue
+                      raise
+                  cands = data.get("candidates") or []
+                  parts = cands[0].get("content", {}).get("parts", []) if cands else []
+                  text = "".join(p.get("text", "") for p in parts).strip()
+                  if not text:
+                      raise ApiError(-1, "empty response")
+                  if not valid(text):
+                      raise ApiError(-2, "output failed format check")
+                  return text, cands[0]
+              raise last
+
 
           def ask_gemini(topic, seen):
               today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
@@ -126,32 +246,42 @@ jobs:
                   "No greeting and no closing remarks."
                   f"{avoid}"
               )
-              body = {"contents": [{"parts": [{"text": prompt}]}],
-                      "tools": [{"google_search": {}}]}
-              url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-              data = post_json(url, body, headers={"x-goog-api-key": KEY}, timeout=90)
+              body = {"contents": [{"parts": [{"text": prompt}]}]}
 
-              cands = data.get("candidates") or []
-              if not cands or "content" not in cands[0]:
-                  raise RuntimeError("Gemini returned no content (maybe blocked by a safety filter)")
-              cand = cands[0]
-              text = "".join(p.get("text", "") for p in cand["content"].get("parts", [])).strip()
-              if not text:
-                  raise RuntimeError("Gemini returned an empty response")
+              errors = {}
+              # Round 0: healthy models only. Round 1+: never lazy, retry everything (cooldowns
+              # ignored), re-list models each round and wait a bit in case of a short outage.
+              for rnd in range(3):
+                  if rnd:
+                      time.sleep(20 * rnd)
+                  for m in pick_models():
+                      if time.monotonic() > DEADLINE:
+                          raise RuntimeError("Out of time. " + " | ".join(f"{k}: {v}" for k, v in errors.items()))
+                      if rnd == 0 and cooling(m):
+                          continue
+                      try:
+                          text, cand = attempt(m, body)
+                      except ApiError as e:
+                          mark_fail(m, e)
+                          errors[m] = str(e)
+                          continue
+                      mark_ok(m)
+                      sources, names = [], set()
+                      for c in cand.get("groundingMetadata", {}).get("groundingChunks", []):
+                          web = c.get("web")
+                          if not web or not web.get("uri"):
+                              continue
+                          name = web.get("title") or urlparse(web["uri"]).netloc
+                          if name in names:
+                              continue
+                          names.add(name)
+                          sources.append(f"[{name}]({web['uri']})")
+                      titles = re.findall(r"\*\*\[\d+\]\s*(.+?)\*\*", text)
+                      return text, sources[:5], titles, m
+              raise RuntimeError("All models failed: " + " | ".join(f"{k}: {v}" for k, v in errors.items()))
 
-              sources, names = [], set()
-              for c in cand.get("groundingMetadata", {}).get("groundingChunks", []):
-                  web = c.get("web")
-                  if not web or not web.get("uri"):
-                      continue
-                  name = web.get("title") or urlparse(web["uri"]).netloc
-                  if name in names:
-                      continue
-                  names.add(name)
-                  sources.append(f"[{name}]({web['uri']})")
-              titles = re.findall(r"\*\*\[\d+\]\s*(.+?)\*\*", text)
-              return text, sources[:5], titles
 
+          # ---------------------------------------------------------------- discord
           def trim(text, limit):
               if len(text) <= limit:
                   return text
@@ -159,7 +289,8 @@ jobs:
               k = cut.rfind("\n\n")
               return (cut[:k] if k > 200 else cut).rstrip() + "\n..."
 
-          def send_discord(topic, kind, text, sources):
+
+          def send_discord(topic, kind, text, sources, model):
               now = dt.datetime.now(dt.timezone.utc)
               trace = "".join(random.choice("0123456789abcdef") for _ in range(10))
               if kind == "hack":
@@ -185,43 +316,55 @@ jobs:
                       "description": desc,
                       "color": color,
                       "timestamp": now.isoformat(),
-                      "footer": {"text": f"{tag} // auto-fetched by gemini // no humans involved"},
+                      "footer": {"text": f"{tag} // via {model} // no humans involved"},
                   }],
               }
-              post_json(HOOK, payload, timeout=30)
+              post_json(HOOK, payload, timeout=30, retries=4, retry_on=(429, 500, 502, 503, 504))
+
 
           def send_error(msg):
+              run = ""
+              if os.environ.get("GITHUB_RUN_ID"):
+                  run = (f"\n{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+                         f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
               try:
                   post_json(HOOK, {
                       "username": "ghost_in_the_shell",
-                      "content": f"```ansi\n\u001b[1;33m[x] SIGNAL LOST\u001b[0m  {msg[:300]}\n```",
+                      "content": f"```ansi\n\u001b[1;33m[x] SIGNAL LOST\u001b[0m  {msg[:700]}\n```{run}",
                       "allowed_mentions": {"parse": []},
-                  }, timeout=30, retries=1)
+                  }, timeout=30, retries=2, retry_on=(429, 500, 502, 503, 504))
               except Exception:
                   pass
 
-          def main():
-              seen = load_seen()
-              topic, kind = pick_topic()
-              text, sources, titles = ask_gemini(topic, seen)
-              if text.strip().upper().startswith("NO_SIGNAL"):
-                  print("No story big enough, skipping this run.")
-                  return
-              send_discord(topic, kind, text, sources)
-              save_seen(seen + titles)
 
-          try:
-              main()
-          except Exception as e:
-              send_error(str(e))
-              raise
+          def main():
+              seen = load_json(SEEN_FILE, [])
+              topic, kind = pick_topic()
+              try:
+                  text, sources, titles, model = ask_gemini(topic, seen)
+              finally:
+                  save_json(HEALTH_FILE, health)       # remember what worked, even after a failure
+              if text.strip().upper().startswith("NO_SIGNAL"):
+                  print(f"No story big enough (model {model}), skipping this run.")
+                  return
+              send_discord(topic, kind, text, sources, model)
+              save_json(SEEN_FILE, (seen + titles)[-SEEN_MAX:])
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as e:
+                  send_error(str(e))
+                  raise
           PY
 
-      - name: Auto commit seen.json
+      - name: Auto commit state (seen.json, model_health.json)
+        if: always()                # save what the bot learned even when the run failed
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "chore: update seen [skip ci]"
+          git add -A
+          git diff --cached --quiet || git commit -m "chore: update bot state [skip ci]"
           git pull --rebase
           git push
