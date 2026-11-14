@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write               # lets the bot commit its state files
+  actions: write                # lets the bot delete old workflow runs
 
 concurrency:
   group: gemini-ping
@@ -40,7 +41,7 @@ jobs:
           HEALTH_FILE = "model_health.json"
           DEADLINE = time.monotonic() + 9 * 60             # hard time budget for the whole run
           FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
-          MAX_TRIES = 8
+          MAX_TRIES = 10
           # If one grounding tool format is rejected, the bot heals itself by trying the other.
           TOOL_VARIANTS = [{"google_search": {}}, {"google_search_retrieval": {}}]
 
@@ -73,10 +74,41 @@ jobs:
 
           # ---------------------------------------------------------------- http
           class ApiError(Exception):
-              """code: HTTP status, 0 = network, -1 = empty answer, -2 = failed format check"""
-              def __init__(self, code, msg):
+              """code: HTTP status, 0 = network, -1 = empty answer, -2 = failed format check.
+              scope (429 only): 'day', 'minute' or 'zero' (no quota at all); retry: seconds to wait."""
+              def __init__(self, code, msg, scope=None, retry=None):
                   super().__init__(msg)
-                  self.code = code
+                  self.code, self.scope, self.retry = code, scope, retry
+
+
+          def explain(e):
+              """Compact, secret-free summary of a Google API error (which quota was hit)."""
+              try:
+                  err = json.load(e).get("error", {})
+              except Exception:
+                  return "", None, None
+              scope = retry = None
+              parts = []
+              for d in err.get("details", []):
+                  t = str(d.get("@type", ""))
+                  if t.endswith("QuotaFailure"):
+                      for v in d.get("violations", [])[:1]:
+                          qid = str(v.get("quotaId", ""))
+                          val = str(v.get("quotaValue", ""))
+                          parts.append(f"quota {qid or v.get('quotaMetric', '?')} limit={val or '?'}")
+                          if val == "0":
+                              scope = "zero"
+                          elif "PerDay" in qid:
+                              scope = "day"
+                          elif "PerMinute" in qid:
+                              scope = "minute"
+                  elif t.endswith("RetryInfo"):
+                      m = re.match(r"([\d.]+)s", str(d.get("retryDelay", "")))
+                      if m:
+                          retry = float(m.group(1))
+              if parts:
+                  return " ".join(parts) + (f" retry={retry:.0f}s" if retry else ""), scope, retry
+              return str(err.get("message", ""))[:150], scope, retry
 
 
           def post_json(url, body, headers=None, timeout=60, retries=3,
@@ -92,12 +124,9 @@ jobs:
                           raw = r.read()
                           return json.loads(raw) if raw else {}
                   except urllib.error.HTTPError as e:
-                      msg = ""
-                      if show_msg:                  # Google's error text helps self-diagnosis
-                          try:
-                              msg = str(json.load(e).get("error", {}).get("message", ""))[:200]
-                          except Exception:
-                              pass
+                      msg, scope, retry = "", None, None
+                      if show_msg:                  # Google's error details help self-diagnosis
+                          msg, scope, retry = explain(e)
                       if e.code in retry_on and i < retries - 1:
                           wait = 5 * 2 ** i
                           ra = e.headers.get("Retry-After") if e.headers else None
@@ -105,7 +134,8 @@ jobs:
                               wait = min(int(ra), 30)
                           time.sleep(wait)
                           continue
-                      raise ApiError(e.code, f"HTTP {e.code} from {host}" + (f": {msg}" if msg else "")) from None
+                      raise ApiError(e.code, f"HTTP {e.code} from {host}" + (f": {msg}" if msg else ""),
+                                     scope, retry) from None
                   except (urllib.error.URLError, TimeoutError, OSError):
                       if i < retries - 1:
                           time.sleep(5 * 2 ** i)
@@ -144,7 +174,8 @@ jobs:
           def mark_fail(name, err):
               fails = min(health.get(name, {}).get("fails", 0) + 1, 10)
               if err.code == 429:
-                  hours = 1                          # quota: try again soon
+                  # zero = this key has no quota for the model, day = used up for today
+                  hours = {"zero": 48, "day": 6}.get(err.scope, 0.25 if err.scope == "minute" else 1)
               elif err.code in (403, 404):
                   hours = 48                         # model not available to this key
               elif err.code in (400, -1, -2):
@@ -179,7 +210,12 @@ jobs:
               except Exception:
                   pass                                            # listing failed: use safety net
               found.sort()
-              ordered = ([PINNED] if PINNED else []) + [n for _, _, n in found] + FALLBACK_MODELS
+              by_tier = {0: [], 1: [], 2: []}
+              for t, _, n in found:
+                  by_tier[t].append(n)
+              # newest flash first, but keep older flash, lite, hardcoded and pro models in reach
+              ordered = (([PINNED] if PINNED else []) + by_tier[0][:3] + by_tier[1][:2]
+                         + by_tier[0][3:5] + FALLBACK_MODELS + by_tier[2][:1])
               return list(dict.fromkeys(ordered))[:MAX_TRIES]
 
 
@@ -192,6 +228,18 @@ jobs:
 
 
           def attempt(model, body):
+              """Like _attempt, but if Google says 'slow down for N seconds', wait once and retry."""
+              try:
+                  return _attempt(model, body)
+              except ApiError as e:
+                  if (e.code == 429 and e.scope not in ("day", "zero") and e.retry and e.retry <= 45
+                          and time.monotonic() + e.retry + 90 < DEADLINE):
+                      time.sleep(e.retry + 1)
+                      return _attempt(model, body)
+                  raise
+
+
+          def _attempt(model, body):
               """One real call = one live test of this model. Raises ApiError on any problem."""
               url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
               last = None
@@ -248,22 +296,28 @@ jobs:
               )
               body = {"contents": [{"parts": [{"text": prompt}]}]}
 
-              errors = {}
-              # Round 0: healthy models only. Round 1+: never lazy, retry everything (cooldowns
-              # ignored), re-list models each round and wait a bit in case of a short outage.
+              errors, dead = {}, set()
+              # Round 0: healthy models only. Round 1+: never lazy, retry everything that could
+              # still work (cooldowns ignored), wait between rounds in case of a short outage.
+              # Models with no quota left today (or no access) are not hammered again this run.
               for rnd in range(3):
+                  todo = [m for m in pick_models() if m not in dead and (rnd > 0 or not cooling(m))]
+                  if not todo:
+                      if rnd == 0:
+                          continue
+                      break
                   if rnd:
                       time.sleep(20 * rnd)
-                  for m in pick_models():
+                  for m in todo:
                       if time.monotonic() > DEADLINE:
                           raise RuntimeError("Out of time. " + " | ".join(f"{k}: {v}" for k, v in errors.items()))
-                      if rnd == 0 and cooling(m):
-                          continue
                       try:
                           text, cand = attempt(m, body)
                       except ApiError as e:
                           mark_fail(m, e)
                           errors[m] = str(e)
+                          if e.code in (403, 404) or e.scope in ("day", "zero"):
+                              dead.add(m)
                           continue
                       mark_ok(m)
                       sources, names = [], set()
@@ -368,3 +422,14 @@ jobs:
           git diff --cached --quiet || git commit -m "chore: update bot state [skip ci]"
           git pull --rebase
           git push
+
+      - name: Delete old workflow runs (keep newest 10)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | .id' \
+            | tail -n +11 \
+            | xargs -r -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/{}" \
+            || true
