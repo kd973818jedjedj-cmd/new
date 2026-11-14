@@ -1,0 +1,122 @@
+name: weekly-mission
+
+# Uses DISCORD_MISSION_WEBHOOK_URL (optional, own channel) or falls back to DISCORD_LOGS_WEBHOOK_URL. The flag is salted with your logs webhook URL, so keep that secret and do not rotate it mid-week.
+
+on:
+  schedule:
+    - cron: "0 15 * * 1"        # Mondays 15:00 UTC
+  workflow_dispatch:
+
+permissions:
+  actions: write                # lets it delete its own old runs
+
+concurrency:
+  group: weekly-mission
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Run
+        env:
+          DISCORD_MISSION_WEBHOOK_URL: ${{ secrets.DISCORD_MISSION_WEBHOOK_URL }}
+          DISCORD_LOGS_WEBHOOK_URL: ${{ secrets.DISCORD_LOGS_WEBHOOK_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, json, time, hmac, hashlib, random, base64, codecs, textwrap, datetime as dt
+          import urllib.request, urllib.error
+
+          RST = "\u001b[0m"
+          RED, GRN, YEL, CYN, MAG, DIM, WHT = "1;31", "1;32", "1;33", "0;36", "0;35", "1;30", "1;37"
+
+          def col(code, s):
+              return "\u001b[" + code + "m" + str(s) + RST
+
+          def block(lines):
+              return "```ansi\n" + "\n".join(lines) + "\n```"
+
+          def post(hook, username, content):
+              if not hook:
+                  sys.exit("Missing webhook secret (see the notes at the top of this workflow)")
+              payload = {"username": username, "content": content[:1950], "allowed_mentions": {"parse": []}}
+              for i in range(3):
+                  try:
+                      req = urllib.request.Request(hook, data=json.dumps(payload).encode(),
+                                                   headers={"Content-Type": "application/json", "User-Agent": "ghost-bot"})
+                      urllib.request.urlopen(req, timeout=30)
+                      return
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 500, 502, 503) and i < 2:
+                          time.sleep(5 * (i + 1))
+                          continue
+                      sys.exit("Discord webhook error HTTP " + str(e.code))
+                  except Exception:
+                      if i < 2:
+                          time.sleep(5)
+                          continue
+                      sys.exit("Cannot reach Discord")
+
+
+          HOOK = os.environ.get("DISCORD_MISSION_WEBHOOK_URL", "") or os.environ.get("DISCORD_LOGS_WEBHOOK_URL", "")
+          # Secret salt = your logs webhook URL, so nobody can compute the flag from this public code.
+          SALT = (os.environ.get("DISCORD_LOGS_WEBHOOK_URL", "") or "ghost").encode()
+
+          A = ["silent", "crimson", "hollow", "static", "phantom", "neon", "cobalt", "velvet", "ember", "frozen", "rogue", "lunar"]
+          B = ["raven", "cipher", "signal", "vault", "wraith", "protocol", "comet", "mirror", "thunder", "shadow", "orbit", "lantern"]
+          MORSE = {"a": ".-", "b": "-...", "c": "-.-.", "d": "-..", "e": ".", "f": "..-.", "g": "--.", "h": "....", "i": "..",
+                   "j": ".---", "k": "-.-", "l": ".-..", "m": "--", "n": "-.", "o": "---", "p": ".--.", "q": "--.-", "r": ".-.",
+                   "s": "...", "t": "-", "u": "..-", "v": "...-", "w": ".--", "x": "-..-", "y": "-.--", "z": "--..",
+                   "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-", "5": ".....", "6": "-....",
+                   "7": "--...", "8": "---..", "9": "----.", "_": "..--.-", "(": "-.--.", ")": "-.--.-"}
+
+          def make(year, week):
+              seed = hmac.new(SALT, ("%d-W%d" % (year, week)).encode(), hashlib.sha256).digest()
+              r = random.Random(seed)
+              flag = "ghost{" + r.choice(A) + "_" + r.choice(B) + "_" + str(r.randint(10, 99)) + "}"
+              kind = r.choice(["caesar", "layers", "reversed", "morse"])
+              name = "OPERATION " + r.choice(A).upper() + " " + r.choice(B).upper()
+              if kind == "caesar":
+                  k = r.randint(3, 23)
+                  cipher = "".join(chr((ord(c) - 97 + k) % 26 + 97) if c.islower() else c for c in flag)
+                  hint, stars, how = "An old Roman trick. Only letters moved, the rest stayed put.", 1, "caesar shift " + str(k)
+              elif kind == "layers":
+                  cipher = base64.b64encode(flag.encode()).decode().encode().hex()
+                  hint, stars, how = "Two layers, both common on the web. Peel the outer one first.", 2, "hex, then base64"
+              elif kind == "reversed":
+                  cipher = base64.b64encode(flag.encode()).decode()[::-1]
+                  hint, stars, how = "Someone read the packet backwards before sending it.", 2, "reversed base64"
+              else:
+                  cipher = " ".join(MORSE[c] for c in flag.replace("{", "(").replace("}", ")"))
+                  hint, stars, how = "Dots and dashes. ( and ) stand in for { and }.", 3, "morse code"
+              return dict(flag=flag, kind=kind, name=name, cipher=cipher, hint=hint, stars=stars, how=how)
+
+          today = dt.datetime.now(dt.timezone.utc).date()
+          y, w, _ = today.isocalendar()
+          py, pw, _ = (today - dt.timedelta(days=7)).isocalendar()
+          cur, prev = make(y, w), make(py, pw)
+
+          lines = [col(RED, "[MISSION BRIEFING]") + " week " + str(w) + " // " + col(WHT, cur["name"]),
+                   col(DIM, "difficulty: ") + col(YEL, "\u2605" * cur["stars"] + "\u2606" * (3 - cur["stars"])), "",
+                   col(CYN, "intercepted transmission:")]
+          lines += textwrap.wrap(cur["cipher"], 60)
+          lines += ["", col(DIM, "hint: ") + cur["hint"],
+                    col(DIM, "flag format: ") + "ghost{word_word_NN}",
+                    col(DIM, "verify: ") + "sha256(flag) starts with " + hashlib.sha256(cur["flag"].encode()).hexdigest()[:12]]
+          msg = (block(lines) + "\n-# post your answer in a spoiler: ||ghost{...}||\n"
+                 "-# last week (" + prev["name"].lower() + "): ||" + prev["flag"] + " via " + prev["how"] + "||")
+          post(HOOK, "mission_control", msg)
+          print("posted mission", cur["name"], cur["kind"])
+          PY
+
+      - name: Delete old runs of this workflow (keep newest 5)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/mission.yml/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | .id' \
+            | tail -n +6 \
+            | xargs -r -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/{}" \
+            || true

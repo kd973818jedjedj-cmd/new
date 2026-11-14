@@ -1,0 +1,114 @@
+name: tip-of-the-day
+
+# Uses the secret DISCORD_WEBHOOK_URL (your news channel). Posts one defensive security tip per day.
+
+on:
+  schedule:
+    - cron: "0 12 * * *"        # daily 12:00 UTC
+  workflow_dispatch:
+
+permissions:
+  actions: write                # lets it delete its own old runs
+
+concurrency:
+  group: tip-of-the-day
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Run
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, json, time, hmac, hashlib, random, base64, codecs, textwrap, datetime as dt
+          import urllib.request, urllib.error
+
+          RST = "\u001b[0m"
+          RED, GRN, YEL, CYN, MAG, DIM, WHT = "1;31", "1;32", "1;33", "0;36", "0;35", "1;30", "1;37"
+
+          def col(code, s):
+              return "\u001b[" + code + "m" + str(s) + RST
+
+          def block(lines):
+              return "```ansi\n" + "\n".join(lines) + "\n```"
+
+          def post(hook, username, content):
+              if not hook:
+                  sys.exit("Missing webhook secret (see the notes at the top of this workflow)")
+              payload = {"username": username, "content": content[:1950], "allowed_mentions": {"parse": []}}
+              for i in range(3):
+                  try:
+                      req = urllib.request.Request(hook, data=json.dumps(payload).encode(),
+                                                   headers={"Content-Type": "application/json", "User-Agent": "ghost-bot"})
+                      urllib.request.urlopen(req, timeout=30)
+                      return
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 500, 502, 503) and i < 2:
+                          time.sleep(5 * (i + 1))
+                          continue
+                      sys.exit("Discord webhook error HTTP " + str(e.code))
+                  except Exception:
+                      if i < 2:
+                          time.sleep(5)
+                          continue
+                      sys.exit("Cannot reach Discord")
+
+
+          HOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+          TIPS = [
+              ("accounts", "Turn on 2FA everywhere it is offered. An authenticator app or a hardware key beats SMS codes."),
+              ("accounts", "Use a password manager and let it generate unique passwords. Reuse is how one leak becomes ten."),
+              ("accounts", "Prefer passkeys when a site offers them. There is no password to phish."),
+              ("accounts", "Surprise MFA prompt? Deny it and change your password. Attackers spam prompts hoping you tap approve."),
+              ("accounts", "Check your email on haveibeenpwned.com and rotate any password that shows up in a breach."),
+              ("accounts", "Use a separate email alias for important accounts so one leaked address does not expose everything."),
+              ("phishing", "Hover before you click. Read the real domain, not the display text. paypa1.com is not PayPal."),
+              ("phishing", "Urgent + scary + a link = slow down. Open the site yourself instead of using the link."),
+              ("phishing", "QR codes are links too. Check where a code leads before you open it, especially stickers and unknown messages."),
+              ("phishing", "No real support agent needs your password or a code you just received. Hang up."),
+              ("devices", "Install updates. Most breaches use bugs that already have a patch."),
+              ("devices", "Turn on full-disk encryption and a screen lock. A lost laptop should be an annoyance, not a breach."),
+              ("devices", "Follow 3-2-1 backups: 3 copies, 2 media types, 1 offsite. Test a restore at least once."),
+              ("devices", "Never plug in a USB stick you found. Treat it as hostile hardware."),
+              ("devices", "Audit your browser extensions. One compromised extension can read every page you visit."),
+              ("devices", "Disable services you do not use (remote desktop, old SMB, open ports). Less surface, fewer problems."),
+              ("network", "A VPN does not make you anonymous, it just moves your trust to the VPN provider. Choose carefully."),
+              ("network", "Change the default password on your router and keep its firmware updated."),
+              ("network", "Set a SIM PIN and a port-out lock with your carrier to blunt SIM-swap attacks."),
+              ("code", "Never commit secrets. Keep .env in .gitignore and rotate any key that ever touched a public repo."),
+              ("code", "Pin dependency versions and review new packages before installing. Typosquats and hijacked packages are real."),
+              ("code", "Enable secret scanning and Dependabot alerts on your repos. Free, and they catch mistakes fast."),
+              ("code", "Protect SSH keys with a passphrase and prefer ed25519. A stolen unprotected key is a stolen server."),
+              ("code", "Give every service the least privilege it needs. A read-only token cannot drop your database."),
+              ("code", "Validate input on the server, always. The client is a suggestion, not a security boundary."),
+              ("habits", "Use a separate account for admin tasks instead of browsing as admin all day."),
+              ("habits", "Review app permissions on your phone. A flashlight app has no business reading your contacts."),
+              ("habits", "After a leak: change the password, check for reuse elsewhere, and expect targeted phishing."),
+              ("habits", "Security questions are guessable. Answer with random strings and store them in your password manager."),
+              ("habits", "Write a tiny incident plan: who to call, what to disconnect, which keys to rotate first."),
+          ]
+
+          today = dt.datetime.now(dt.timezone.utc).date()
+          i = today.toordinal() % len(TIPS)
+          cat, text = TIPS[i]
+          lines = [col(GRN, "[TIP OF THE DAY]") + " #" + str(i + 1).zfill(2) + " // " + col(CYN, cat), ""]
+          lines += textwrap.wrap(text, 58)
+          post(HOOK, "tip_daemon", block(lines))
+          print("posted tip", i + 1)
+          PY
+
+      - name: Delete old runs of this workflow (keep newest 5)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/tip.yml/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | .id' \
+            | tail -n +6 \
+            | xargs -r -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/{}" \
+            || true

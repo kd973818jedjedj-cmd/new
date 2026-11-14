@@ -1,0 +1,106 @@
+name: weekly-leaderboard
+
+# Uses DISCORD_LOGS_WEBHOOK_URL. Optional repository variable OPERATORS (comma separated names) replaces the default fictional handles. Scores are fake.
+
+on:
+  schedule:
+    - cron: "0 18 * * 0"        # Sundays 18:00 UTC
+  workflow_dispatch:
+
+permissions:
+  actions: write                # lets it delete its own old runs
+
+concurrency:
+  group: weekly-leaderboard
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Run
+        env:
+          DISCORD_LOGS_WEBHOOK_URL: ${{ secrets.DISCORD_LOGS_WEBHOOK_URL }}
+          OPERATORS: ${{ vars.OPERATORS }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, json, time, hmac, hashlib, random, base64, codecs, textwrap, datetime as dt
+          import urllib.request, urllib.error
+
+          RST = "\u001b[0m"
+          RED, GRN, YEL, CYN, MAG, DIM, WHT = "1;31", "1;32", "1;33", "0;36", "0;35", "1;30", "1;37"
+
+          def col(code, s):
+              return "\u001b[" + code + "m" + str(s) + RST
+
+          def block(lines):
+              return "```ansi\n" + "\n".join(lines) + "\n```"
+
+          def post(hook, username, content):
+              if not hook:
+                  sys.exit("Missing webhook secret (see the notes at the top of this workflow)")
+              payload = {"username": username, "content": content[:1950], "allowed_mentions": {"parse": []}}
+              for i in range(3):
+                  try:
+                      req = urllib.request.Request(hook, data=json.dumps(payload).encode(),
+                                                   headers={"Content-Type": "application/json", "User-Agent": "ghost-bot"})
+                      urllib.request.urlopen(req, timeout=30)
+                      return
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 500, 502, 503) and i < 2:
+                          time.sleep(5 * (i + 1))
+                          continue
+                      sys.exit("Discord webhook error HTTP " + str(e.code))
+                  except Exception:
+                      if i < 2:
+                          time.sleep(5)
+                          continue
+                      sys.exit("Cannot reach Discord")
+
+
+          HOOK = os.environ.get("DISCORD_LOGS_WEBHOOK_URL", "")
+          SALT = (HOOK or "ghost").encode()
+          DEFAULT = ["n1ghtowl", "cipher_x", "vortex", "ghost_01", "zer0cool", "raven", "h3lix", "wraith", "nyx", "blackbox"]
+          # Set a repository variable called OPERATORS (comma separated) to use your own names.
+          names = [n.strip()[:12] for n in (os.environ.get("OPERATORS") or "").split(",") if n.strip()] or DEFAULT
+          EPOCH = dt.date(2026, 1, 5)
+
+          def score(name, upto):
+              total = 0
+              for wk in range(1, upto + 1):
+                  r = random.Random(hmac.new(SALT, ("%d|%s" % (wk, name)).encode(), hashlib.sha256).digest())
+                  total += r.randint(0, 100) + (150 if r.random() < 0.1 else 0)
+              return total
+
+          def ranking(upto):
+              return sorted(names, key=lambda n: (-score(n, upto), n))
+
+          today = dt.datetime.now(dt.timezone.utc).date()
+          week = max(2, (today - EPOCH).days // 7)
+          now_r, prev_r = ranking(week), ranking(week - 1)
+          top = score(now_r[0], week) or 1
+          lines = [col(MAG, "[LEADERBOARD]") + " top operators // week " + str(week), col(DIM, "-" * 46)]
+          for pos, n in enumerate(now_r[:10], 1):
+              s = score(n, week)
+              move = prev_r.index(n) + 1 - pos
+              arrow = col(GRN, "\u25b2 " + str(move)) if move > 0 else col(RED, "\u25bc " + str(-move)) if move < 0 else col(DIM, "= ")
+              n_bar = int(14 * s / top)
+              lines.append(("#" + str(pos)).ljust(4) + n.ljust(13) + col(CYN if pos > 3 else YEL, "\u2588" * n_bar + "\u2591" * (14 - n_bar))
+                           + " " + str(s).rjust(5) + "  " + arrow)
+          best = max(names, key=lambda n: (score(n, week) - score(n, week - 1), n))
+          lines += [col(DIM, "-" * 46), "operator of the week: " + col(GRN, best) + " (+" + str(score(best, week) - score(best, week - 1)) + ")"]
+          post(HOOK, "rank_daemon", block(lines))
+          print("posted leaderboard week", week)
+          PY
+
+      - name: Delete old runs of this workflow (keep newest 5)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/leaderboard.yml/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | .id' \
+            | tail -n +6 \
+            | xargs -r -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/{}" \
+            || true

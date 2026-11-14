@@ -1,0 +1,110 @@
+name: boot-banner
+
+# Run manually once. Uses DISCORD_BOOT_WEBHOOK_URL (webhook of your welcome channel); falls back to DISCORD_LOGS_WEBHOOK_URL.
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: "Banner text (letters only, max 6)"
+        type: string
+        default: "GHOST"
+
+permissions: {}
+
+concurrency:
+  group: boot-banner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Run
+        env:
+          DISCORD_BOOT_WEBHOOK_URL: ${{ secrets.DISCORD_BOOT_WEBHOOK_URL }}
+          DISCORD_LOGS_WEBHOOK_URL: ${{ secrets.DISCORD_LOGS_WEBHOOK_URL }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, json, time, hmac, hashlib, random, base64, codecs, textwrap, datetime as dt
+          import urllib.request, urllib.error
+
+          RST = "\u001b[0m"
+          RED, GRN, YEL, CYN, MAG, DIM, WHT = "1;31", "1;32", "1;33", "0;36", "0;35", "1;30", "1;37"
+
+          def col(code, s):
+              return "\u001b[" + code + "m" + str(s) + RST
+
+          def block(lines):
+              return "```ansi\n" + "\n".join(lines) + "\n```"
+
+          def post(hook, username, content):
+              if not hook:
+                  sys.exit("Missing webhook secret (see the notes at the top of this workflow)")
+              payload = {"username": username, "content": content[:1950], "allowed_mentions": {"parse": []}}
+              for i in range(3):
+                  try:
+                      req = urllib.request.Request(hook, data=json.dumps(payload).encode(),
+                                                   headers={"Content-Type": "application/json", "User-Agent": "ghost-bot"})
+                      urllib.request.urlopen(req, timeout=30)
+                      return
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 500, 502, 503) and i < 2:
+                          time.sleep(5 * (i + 1))
+                          continue
+                      sys.exit("Discord webhook error HTTP " + str(e.code))
+                  except Exception:
+                      if i < 2:
+                          time.sleep(5)
+                          continue
+                      sys.exit("Cannot reach Discord")
+
+
+          HOOK = os.environ.get("DISCORD_BOOT_WEBHOOK_URL", "") or os.environ.get("DISCORD_LOGS_WEBHOOK_URL", "")
+          TITLE = "".join(c for c in (os.environ.get("TITLE") or "GHOST").upper() if c.isalpha() or c == " ")[:6].strip() or "GHOST"
+
+          RULES = [                      # edit these to match your server
+              "be sharp, be kind",
+              "no illegal stuff, no real targets, no requests to hack real people",
+              "share intel with sources, flag rumors as rumors",
+              "use ||spoilers|| for mission answers",
+              "have fun",
+          ]
+
+          FONT = {
+           "A": [" ### ", "#   #", "#####", "#   #", "#   #"], "B": ["#### ", "#   #", "#### ", "#   #", "#### "],
+           "C": [" ####", "#    ", "#    ", "#    ", " ####"], "D": ["#### ", "#   #", "#   #", "#   #", "#### "],
+           "E": ["#####", "#    ", "#### ", "#    ", "#####"], "F": ["#####", "#    ", "#### ", "#    ", "#    "],
+           "G": [" ####", "#    ", "#  ##", "#   #", " ####"], "H": ["#   #", "#   #", "#####", "#   #", "#   #"],
+           "I": ["#####", "  #  ", "  #  ", "  #  ", "#####"], "J": ["  ###", "   # ", "   # ", "#  # ", " ##  "],
+           "K": ["#   #", "#  # ", "###  ", "#  # ", "#   #"], "L": ["#    ", "#    ", "#    ", "#    ", "#####"],
+           "M": ["#   #", "## ##", "# # #", "#   #", "#   #"], "N": ["#   #", "##  #", "# # #", "#  ##", "#   #"],
+           "O": [" ### ", "#   #", "#   #", "#   #", " ### "], "P": ["#### ", "#   #", "#### ", "#    ", "#    "],
+           "Q": [" ### ", "#   #", "# # #", "#  # ", " ## #"], "R": ["#### ", "#   #", "#### ", "#  # ", "#   #"],
+           "S": [" ####", "#    ", " ### ", "    #", "#### "], "T": ["#####", "  #  ", "  #  ", "  #  ", "  #  "],
+           "U": ["#   #", "#   #", "#   #", "#   #", " ### "], "V": ["#   #", "#   #", "#   #", " # # ", "  #  "],
+           "W": ["#   #", "#   #", "# # #", "## ##", "#   #"], "X": ["#   #", " # # ", "  #  ", " # # ", "#   #"],
+           "Y": ["#   #", " # # ", "  #  ", "  #  ", "  #  "], "Z": ["#####", "   # ", "  #  ", " #   ", "#####"],
+           " ": ["   ", "   ", "   ", "   ", "   "],
+          }
+
+          art = [" ".join(FONT[ch][r] for ch in TITLE).replace("#", "\u2588") for r in range(5)]
+          m1 = block([col(GRN, row) for row in art] + ["", col(DIM, "[ SHELL ONLINE ]  secure channel // intel collective")])
+
+          boot = ["Mounted encrypted volume /vault", "Started mesh-router.service", "Loaded intel-feed daemon",
+                  "Initialized entropy pool", "Loaded firewall ruleset", "Reached target network-online",
+                  "Started shadow-sync.service", "Reached target multi-user"]
+          m2 = block([col(GRN, "[ OK ]") + " " + b for b in boot] + [col(YEL, "[WARN]") + " unknown operators detected",
+                                                                      col(GRN, "[ OK ]") + " welcome, operator."])
+          m3 = block([col(CYN, "ACCESS PROTOCOL"), col(DIM, "-" * 40)]
+                     + [col(YEL, str(n)) + ". " + r for n, r in enumerate(RULES, 1)])
+
+          post(HOOK, "root@ghost-shell", m1)
+          time.sleep(1.5)
+          post(HOOK, "root@ghost-shell", m2)
+          time.sleep(1.5)
+          post(HOOK, "root@ghost-shell", m3)
+          print("posted boot banner:", TITLE)
+          PY
