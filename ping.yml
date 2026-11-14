@@ -1,0 +1,227 @@
+name: gemini-ping
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"      # every 6 hours (UTC). Edit to taste.
+  workflow_dispatch:            # manual run button in the Actions tab
+
+permissions:
+  contents: write               # lets the bot commit seen.json
+
+concurrency:
+  group: gemini-ping
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run bot
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import os, re, json, random, time, datetime as dt
+          import urllib.request, urllib.error
+          from urllib.parse import urlparse
+
+          KEY = os.environ["GEMINI_API_KEY"]
+          HOOK = os.environ["DISCORD_WEBHOOK_URL"]
+          MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+          SEEN_FILE, SEEN_MAX = "seen.json", 60
+
+          HACK_TOPICS = [
+              "the biggest cyberattacks and data breaches hitting famous corporations, governments or critical infrastructure",
+              "major ransomware attacks causing large disruption at companies, hospitals or governments",
+              "critical zero-day vulnerabilities being actively exploited and affecting millions of devices",
+              "major software supply-chain attacks (npm, PyPI, poisoned updates)",
+          ]
+          BREAKING_TOPICS = [
+              "major shake-ups at top tech companies: CEO changes, top executives leaving, mass layoffs, giant acquisitions",
+              "major lawsuits, fines and antitrust investigations targeting big tech",
+              "major turning points in AI: shocking new models, billion-dollar deals, legal fights",
+          ]
+          TECH_TOPICS = [
+              "AI and large language models",
+              "hardware, chips and GPUs",
+              "open source and developer tools",
+          ]
+
+          def pick_topic():
+              r = random.random()
+              if r < 0.55:
+                  return random.choice(HACK_TOPICS), "hack"
+              if r < 0.85:
+                  return random.choice(BREAKING_TOPICS), "breaking"
+              return random.choice(TECH_TOPICS), "tech"
+
+          def post_json(url, body, headers=None, timeout=60, retries=3):
+              data = json.dumps(body).encode()
+              h = {"Content-Type": "application/json", "User-Agent": "gemini-discord-bot"}
+              h.update(headers or {})
+              host = urlparse(url).netloc   # log hostname only, never the full URL
+              for i in range(retries):
+                  try:
+                      req = urllib.request.Request(url, data=data, headers=h)
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          raw = r.read()
+                          return json.loads(raw) if raw else {}
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 500, 502, 503, 504) and i < retries - 1:
+                          time.sleep(5 * 2 ** i)
+                          continue
+                      raise RuntimeError(f"HTTP {e.code} from {host}") from None
+                  except (urllib.error.URLError, TimeoutError):
+                      if i < retries - 1:
+                          time.sleep(5 * 2 ** i)
+                          continue
+                      raise RuntimeError(f"Cannot reach {host}") from None
+
+          def load_seen():
+              try:
+                  with open(SEEN_FILE, encoding="utf-8") as f:
+                      return json.load(f)
+              except (FileNotFoundError, json.JSONDecodeError):
+                  return []
+
+          def save_seen(seen):
+              with open(SEEN_FILE, "w", encoding="utf-8") as f:
+                  json.dump(seen[-SEEN_MAX:], f, ensure_ascii=False, indent=1)
+
+          def ask_gemini(topic, seen):
+              today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+              avoid = ""
+              if seen:
+                  avoid = ("\nALREADY POSTED, DO NOT REPEAT THESE STORIES:\n- "
+                           + "\n- ".join(seen[-30:]) + "\n")
+              prompt = (
+                  f"Today is {today}. Search the web for the MOST RECENT news (last few days) about: {topic}.\n\n"
+                  "SIGNIFICANCE FILTER: only pick stories that are truly big, meeting at least one of: "
+                  "(a) involves a very famous company or organization, "
+                  "(b) affects millions of people or causes huge damage, "
+                  "(c) is making waves, covered by many major outlets at once. "
+                  "Skip minor stories and anything backed only by a single small blog. "
+                  "Return at most 3 stories, biggest first. Fewer than 3 is fine, never pad the list. "
+                  "If NOTHING qualifies, reply with exactly one word: NO_SIGNAL\n\n"
+                  "ANTI-HALLUCINATION: every story must be confirmed by at least 2 reputable outlets. "
+                  "If something is only a rumor or unconfirmed, label it 'UNCONFIRMED' or skip it. "
+                  "Never speculate and never add details the sources do not state.\n\n"
+                  "OUTPUT LANGUAGE: write in English, in the voice of a cool cyber-intelligence news channel, "
+                  "but stay factually accurate. Use exactly this format for each story:\n"
+                  "**[number] Victim or event name**\n"
+                  "- Severity: \U0001F534 CRITICAL or \U0001F7E0 HIGH or \U0001F7E1 NOTABLE\n"
+                  "- What happened: 1-2 sentences with scale (people, money, records, downtime) if known.\n"
+                  "- How it happened: 1-2 sentences, only at the level the sources have publicly reported. "
+                  "No exploit code, payloads or reproduction steps. If unknown, say it is under investigation. "
+                  "For non-hack stories, replace this line with 'Context'.\n"
+                  "- Impact: 1 sentence on the consequence or the lesson.\n\n"
+                  "No greeting and no closing remarks."
+                  f"{avoid}"
+              )
+              body = {"contents": [{"parts": [{"text": prompt}]}],
+                      "tools": [{"google_search": {}}]}
+              url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+              data = post_json(url, body, headers={"x-goog-api-key": KEY}, timeout=90)
+
+              cands = data.get("candidates") or []
+              if not cands or "content" not in cands[0]:
+                  raise RuntimeError("Gemini returned no content (maybe blocked by a safety filter)")
+              cand = cands[0]
+              text = "".join(p.get("text", "") for p in cand["content"].get("parts", [])).strip()
+              if not text:
+                  raise RuntimeError("Gemini returned an empty response")
+
+              sources, names = [], set()
+              for c in cand.get("groundingMetadata", {}).get("groundingChunks", []):
+                  web = c.get("web")
+                  if not web or not web.get("uri"):
+                      continue
+                  name = web.get("title") or urlparse(web["uri"]).netloc
+                  if name in names:
+                      continue
+                  names.add(name)
+                  sources.append(f"[{name}]({web['uri']})")
+              titles = re.findall(r"\*\*\[\d+\]\s*(.+?)\*\*", text)
+              return text, sources[:5], titles
+
+          def trim(text, limit):
+              if len(text) <= limit:
+                  return text
+              cut = text[:limit]
+              k = cut.rfind("\n\n")
+              return (cut[:k] if k > 200 else cut).rstrip() + "\n..."
+
+          def send_discord(topic, kind, text, sources):
+              now = dt.datetime.now(dt.timezone.utc)
+              trace = "".join(random.choice("0123456789abcdef") for _ in range(10))
+              if kind == "hack":
+                  banner, color, tag = "\u001b[1;31m[!] BREACH ALERT\u001b[0m", 0xFF0033, "BREACH"
+              elif kind == "breaking":
+                  banner, color, tag = "\u001b[1;33m[!] BREAKING // CLASSIFIED\u001b[0m", 0xFFA500, "BREAKING"
+              else:
+                  banner, color, tag = "\u001b[1;32m[+] INTERCEPTING FEED\u001b[0m", 0x00FF41, "TECH"
+              header = (
+                  "```ansi\n"
+                  f"{banner}  id:{trace}\n"
+                  f"\u001b[0;36m[>] channel:\u001b[0m {topic[:70]}\n"
+                  f"\u001b[0;36m[>] time   :\u001b[0m {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                  "```"
+              )
+              tail = ("\n\n**Sources:** " + " \u00b7 ".join(sources)) if sources else ""
+              desc = trim(text, 4000 - len(tail)) + tail
+              payload = {
+                  "username": "ghost_in_the_shell",
+                  "content": header,
+                  "allowed_mentions": {"parse": []},   # block @everyone/@here from AI text
+                  "embeds": [{
+                      "description": desc,
+                      "color": color,
+                      "timestamp": now.isoformat(),
+                      "footer": {"text": f"{tag} // auto-fetched by gemini // no humans involved"},
+                  }],
+              }
+              post_json(HOOK, payload, timeout=30)
+
+          def send_error(msg):
+              try:
+                  post_json(HOOK, {
+                      "username": "ghost_in_the_shell",
+                      "content": f"```ansi\n\u001b[1;33m[x] SIGNAL LOST\u001b[0m  {msg[:300]}\n```",
+                      "allowed_mentions": {"parse": []},
+                  }, timeout=30, retries=1)
+              except Exception:
+                  pass
+
+          def main():
+              seen = load_seen()
+              topic, kind = pick_topic()
+              text, sources, titles = ask_gemini(topic, seen)
+              if text.strip().upper().startswith("NO_SIGNAL"):
+                  print("No story big enough, skipping this run.")
+                  return
+              send_discord(topic, kind, text, sources)
+              save_seen(seen + titles)
+
+          try:
+              main()
+          except Exception as e:
+              send_error(str(e))
+              raise
+          PY
+
+      - name: Auto commit seen.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "chore: update seen [skip ci]"
+          git pull --rebase
+          git push
