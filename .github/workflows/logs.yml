@@ -1,0 +1,175 @@
+name: system-logs
+
+on:
+  schedule:
+    - cron: "7 * * * *"        # hourly (UTC). ~25% of cycles stay silent on purpose.
+  workflow_dispatch:            # manual run always posts
+
+permissions:
+  actions: write                # lets it delete its own old runs
+
+concurrency:
+  group: system-logs
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Post a fake log
+        env:
+          DISCORD_LOGS_WEBHOOK_URL: ${{ secrets.DISCORD_LOGS_WEBHOOK_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, random, time, json, datetime as dt
+          import urllib.request, urllib.error
+
+          HOOK = os.environ.get("DISCORD_LOGS_WEBHOOK_URL", "")
+          if not HOOK:
+              sys.exit("Missing secret DISCORD_LOGS_WEBHOOK_URL (create a webhook for your logs channel)")
+
+          # ~25% of scheduled runs stay silent so the rhythm looks organic; manual runs always post
+          if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch" and random.random() < 0.25:
+              print("quiet cycle, nothing posted")
+              sys.exit(0)
+
+          RST = "\u001b[0m"
+          RED, GRN, YEL, CYN, MAG, DIM = "1;31", "1;32", "1;33", "0;36", "0;35", "1;30"
+
+          def col(code, s):
+              return "\u001b[" + code + "m" + str(s) + RST
+
+          _clock = dt.datetime.now(dt.timezone.utc)
+          def ts():
+              global _clock
+              _clock += dt.timedelta(milliseconds=random.randint(20, 900))
+              return col(DIM, _clock.strftime("%H:%M:%S.%f")[:-3])
+
+          # Documentation-only address ranges (RFC 5737) and a reserved TLD: none of this is real.
+          def ip():
+              return random.choice(["203.0.113", "198.51.100", "192.0.2"]) + "." + str(random.randint(1, 254))
+
+          def host():
+              name = random.choice(["ghost", "raven", "cipher", "onyx", "vortex", "nyx", "helix",
+                                    "wraith", "specter", "blackbox", "ember", "cobalt"])
+              return name + "-" + "%04x" % random.randint(0, 0xFFFF) + ".void.invalid"
+
+          def bar(p, width=20):
+              n = int(width * p / 100)
+              return "[" + "\u2588" * n + "\u2591" * (width - n) + "] " + str(p).rjust(3) + "%"
+
+          def scan():
+              target = ip()
+              ports = sorted(random.sample([(22, "ssh"), (25, "smtp"), (53, "domain"), (80, "http"),
+                                            (443, "https"), (445, "smb"), (3306, "mysql"),
+                                            (5432, "postgresql"), (6379, "redis"), (8080, "http-proxy")],
+                                           k=random.randint(3, 5)))
+              out = [ts() + " " + col(CYN, "$") + " nmap -sS -Pn -T4 " + target, "PORT      STATE     SERVICE"]
+              n_open = 0
+              for port, svc in ports:
+                  state = random.choice(["open", "open", "open", "filtered", "closed"])
+                  n_open += state == "open"
+                  c = GRN if state == "open" else YEL if state == "filtered" else DIM
+                  out.append((str(port) + "/tcp").ljust(9) + " " + col(c, state.ljust(9)) + " " + svc)
+              out.append(ts() + " " + col(GRN, "[+]") + " scan complete: " + str(n_open) + " open, OS guess: Linux 5.x")
+              return out
+
+          def firewall():
+              out = []
+              for _ in range(random.randint(3, 5)):
+                  reason = random.choice(["ssh brute force", "port sweep", "malformed packet", "known bad signature", "tls downgrade"])
+                  out.append(ts() + " " + col(RED, "[fw] DROP") + " " + ip() + " -> :" + str(random.choice([22, 23, 445, 3389, 8080]))
+                             + " " + col(YEL, reason) + " x" + str(random.randint(3, 900)))
+              out.append(ts() + " " + col(GRN, "[fw]") + " ruleset reloaded, " + str(random.randint(1200, 9000)) + " signatures active")
+              return out
+
+          def decrypt():
+              f = "vault_" + "%03d" % random.randint(1, 999) + ".aes"
+              out = [ts() + " " + col(CYN, "[decrypt]") + " target " + f + " (AES-256-GCM)"]
+              for p in sorted(random.sample(range(5, 95), 2)):
+                  out.append(ts() + " " + bar(p))
+              if random.random() < 0.7:
+                  out += [ts() + " " + bar(100), ts() + " " + col(GRN, "[ OK ]") + " integrity verified, sha256 " + "%08x" % random.getrandbits(32) + "..."]
+              else:
+                  out += [ts() + " " + col(RED, "[FAIL]") + " bad padding, rotating key schedule", ts() + " " + col(YEL, "[retry]") + " attempt 2/3"]
+              return out
+
+          def heartbeat():
+              return [
+                  ts() + " " + col(MAG, "[sys]") + " uptime " + str(random.randint(2, 90)) + "d " + str(random.randint(0, 23)).zfill(2) + "h"
+                  + " | load " + "%.2f" % random.uniform(0.05, 1.8) + " | mem " + "%.1f" % random.uniform(1.5, 7.5) + "G/16G",
+                  ts() + " " + col(MAG, "[sys]") + " nodes online " + str(random.randint(9, 12)) + "/12 | threats neutralized: " + str(random.randint(900, 99999)),
+                  ts() + " " + col(GRN, "[ OK ]") + " heartbeat acknowledged",
+              ]
+
+          def hexdump():
+              base = random.randint(0x7F000000, 0x7FFFFFFF) & ~0xF
+              out = [ts() + " " + col(CYN, "[mem]") + " dump @ 0x%08x" % base]
+              for i in range(4):
+                  row = [random.randint(0, 255) for _ in range(16)]
+                  hx = " ".join("%02x" % b for b in row[:8]) + "  " + " ".join("%02x" % b for b in row[8:])
+                  asc = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+                  out.append("%08x  %s  |%s|" % (base + i * 16, hx, asc))
+              return out
+
+          def mesh():
+              hops = [host() for _ in range(random.randint(3, 4))]
+              out = [ts() + " " + col(CYN, "[mesh]") + " building circuit..."]
+              for i, h in enumerate(hops, 1):
+                  out.append("  hop " + str(i) + " " + h.ljust(30) + col(GRN, str(random.randint(12, 140)) + "ms"))
+              out.append(ts() + " " + col(GRN, "[ OK ]") + " circuit established, rtt " + str(random.randint(180, 520)) + "ms")
+              return out
+
+          def boot():
+              pool = ["Mounted /dev/ghost0", "Started kernel module void_net", "Loaded intel-feed daemon",
+                      "Reached target network-online", "Started shadow-sync.service", "Initialized entropy pool",
+                      "Mounted encrypted volume /vault", "Started watchdog.timer"]
+              out = [ts() + " " + col(GRN, "[ OK ]") + " " + p for p in random.sample(pool, 5)]
+              out.insert(random.randint(1, 4), ts() + " " + col(YEL, "[WARN]") + " entropy low, reseeding")
+              return out
+
+          def feedsync():
+              return [
+                  ts() + " " + col(CYN, "[feed]") + " syncing sources... " + str(random.randint(4, 5)) + "/5 reachable",
+                  ts() + " " + col(CYN, "[feed]") + " " + str(random.randint(20, 80)) + " headlines cached, " + str(random.randint(2, 15)) + " duplicates dropped",
+                  ts() + " " + col(MAG, "[ai]") + " ranking stories by impact score...",
+                  ts() + " " + col(GRN, "[ OK ]") + " next broadcast window armed",
+              ]
+
+          GENS = [(scan, 3), (firewall, 3), (decrypt, 3), (heartbeat, 2), (hexdump, 2), (mesh, 2), (boot, 1), (feedsync, 2)]
+          gen = random.choices([g for g, _ in GENS], weights=[w for _, w in GENS])[0]
+          lines = gen()
+          msg = ("```ansi\n" + "\n".join(lines) + "\n```\n"
+                 "-# simulated telemetry // all hosts fictional (RFC 5737), nothing here is real")
+          payload = {"username": "root@ghost-shell", "content": msg[:1900], "allowed_mentions": {"parse": []}}
+
+          for i in range(3):
+              try:
+                  req = urllib.request.Request(HOOK, data=json.dumps(payload).encode(),
+                                               headers={"Content-Type": "application/json", "User-Agent": "ghost-logs"})
+                  urllib.request.urlopen(req, timeout=30)
+                  print("posted:", gen.__name__)
+                  break
+              except urllib.error.HTTPError as e:
+                  if e.code in (429, 500, 502, 503) and i < 2:
+                      time.sleep(5 * (i + 1))
+                      continue
+                  sys.exit("Discord webhook error HTTP " + str(e.code))
+              except Exception:
+                  if i < 2:
+                      time.sleep(5)
+                      continue
+                  sys.exit("Cannot reach Discord")
+          PY
+
+      - name: Delete old runs of this workflow (keep newest 5)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/logs.yml/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | .id' \
+            | tail -n +6 \
+            | xargs -r -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/{}" \
+            || true
