@@ -61,11 +61,13 @@ jobs:
 
           def scan():
               target = ip()
-              ports = sorted(random.sample([(22, "ssh"), (25, "smtp"), (53, "domain"), (80, "http"),
-                                            (443, "https"), (445, "smb"), (3306, "mysql"),
-                                            (5432, "postgresql"), (6379, "redis"), (8080, "http-proxy")],
-                                           k=random.randint(3, 5)))
-              out = [ts() + " " + col(CYN, "$") + " nmap -sS -Pn -T4 " + target, "PORT      STATE     SERVICE"]
+              ports = sorted(random.sample([(21, "ftp"), (22, "ssh"), (25, "smtp"), (53, "domain"), (80, "http"),
+                                            (110, "pop3"), (443, "https"), (445, "smb"), (3306, "mysql"),
+                                            (3389, "ms-wbt-server"), (5432, "postgresql"), (6379, "redis"),
+                                            (8080, "http-proxy"), (9200, "elasticsearch")], k=random.randint(5, 8)))
+              out = [ts() + " " + col(CYN, "$") + " nmap -sS -sV -Pn -T4 " + target,
+                     ts() + " Starting scan, host is up (" + "%.3f" % random.uniform(0.004, 0.09) + "s latency)",
+                     "PORT      STATE     SERVICE"]
               n_open = 0
               for port, svc in ports:
                   state = random.choice(["open", "open", "open", "filtered", "closed"])
@@ -73,32 +75,39 @@ jobs:
                   c = GRN if state == "open" else YEL if state == "filtered" else DIM
                   out.append((str(port) + "/tcp").ljust(9) + " " + col(c, state.ljust(9)) + " " + svc)
               out.append(ts() + " " + col(GRN, "[+]") + " scan complete: " + str(n_open) + " open, OS guess: Linux 5.x")
+              out.append(ts() + " " + col(CYN, "[*]") + " saved report to /vault/scans/" + "%06x" % random.getrandbits(24) + ".xml")
               return out
 
           def firewall():
               out = []
-              for _ in range(random.randint(3, 5)):
-                  reason = random.choice(["ssh brute force", "port sweep", "malformed packet", "known bad signature", "tls downgrade"])
-                  out.append(ts() + " " + col(RED, "[fw] DROP") + " " + ip() + " -> :" + str(random.choice([22, 23, 445, 3389, 8080]))
+              for _ in range(random.randint(7, 12)):
+                  reason = random.choice(["ssh brute force", "port sweep", "malformed packet", "known bad signature",
+                                          "tls downgrade", "sql injection pattern", "dns tunnel suspected"])
+                  out.append(ts() + " " + col(RED, "[fw] DROP") + " " + ip() + " -> :" + str(random.choice([22, 23, 445, 1433, 3389, 8080]))
                              + " " + col(YEL, reason) + " x" + str(random.randint(3, 900)))
               out.append(ts() + " " + col(GRN, "[fw]") + " ruleset reloaded, " + str(random.randint(1200, 9000)) + " signatures active")
               return out
 
           def decrypt():
               f = "vault_" + "%03d" % random.randint(1, 999) + ".aes"
-              out = [ts() + " " + col(CYN, "[decrypt]") + " target " + f + " (AES-256-GCM)"]
-              for p in sorted(random.sample(range(5, 95), 2)):
+              out = [ts() + " " + col(CYN, "[decrypt]") + " target " + f + " (AES-256-GCM)",
+                     ts() + " " + col(CYN, "[decrypt]") + " deriving key schedule, " + str(random.randint(50, 400)) + "k iterations"]
+              for p in sorted(random.sample(range(5, 95), random.randint(3, 5))):
                   out.append(ts() + " " + bar(p))
               if random.random() < 0.7:
                   out += [ts() + " " + bar(100), ts() + " " + col(GRN, "[ OK ]") + " integrity verified, sha256 " + "%08x" % random.getrandbits(32) + "..."]
               else:
-                  out += [ts() + " " + col(RED, "[FAIL]") + " bad padding, rotating key schedule", ts() + " " + col(YEL, "[retry]") + " attempt 2/3"]
+                  out += [ts() + " " + col(RED, "[FAIL]") + " bad padding, rotating key schedule", ts() + " " + col(YEL, "[retry]") + " attempt 2/3",
+                          ts() + " " + bar(100), ts() + " " + col(GRN, "[ OK ]") + " recovered on retry"]
               return out
 
           def heartbeat():
               return [
                   ts() + " " + col(MAG, "[sys]") + " uptime " + str(random.randint(2, 90)) + "d " + str(random.randint(0, 23)).zfill(2) + "h"
                   + " | load " + "%.2f" % random.uniform(0.05, 1.8) + " | mem " + "%.1f" % random.uniform(1.5, 7.5) + "G/16G",
+                  ts() + " " + col(MAG, "[sys]") + " cpu " + " ".join(str(random.randint(1, 95)).rjust(2) + "%" for _ in range(4))
+                  + " | net rx " + str(random.randint(10, 900)) + "kB/s tx " + str(random.randint(5, 400)) + "kB/s",
+                  ts() + " " + col(MAG, "[sys]") + " disk /vault " + str(random.randint(12, 88)) + "% | swap " + str(random.randint(0, 20)) + "%",
                   ts() + " " + col(MAG, "[sys]") + " nodes online " + str(random.randint(9, 12)) + "/12 | threats neutralized: " + str(random.randint(900, 99999)),
                   ts() + " " + col(GRN, "[ OK ]") + " heartbeat acknowledged",
               ]
@@ -106,7 +115,7 @@ jobs:
           def hexdump():
               base = random.randint(0x7F000000, 0x7FFFFFFF) & ~0xF
               out = [ts() + " " + col(CYN, "[mem]") + " dump @ 0x%08x" % base]
-              for i in range(4):
+              for i in range(random.randint(6, 10)):
                   row = [random.randint(0, 255) for _ in range(16)]
                   hx = " ".join("%02x" % b for b in row[:8]) + "  " + " ".join("%02x" % b for b in row[8:])
                   asc = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
@@ -114,19 +123,22 @@ jobs:
               return out
 
           def mesh():
-              hops = [host() for _ in range(random.randint(3, 4))]
-              out = [ts() + " " + col(CYN, "[mesh]") + " building circuit..."]
+              hops = [host() for _ in range(random.randint(4, 6))]
+              out = [ts() + " " + col(CYN, "[mesh]") + " building circuit, " + str(len(hops)) + " hops..."]
               for i, h in enumerate(hops, 1):
                   out.append("  hop " + str(i) + " " + h.ljust(30) + col(GRN, str(random.randint(12, 140)) + "ms"))
+              out.append(ts() + " " + col(YEL, "[mesh]") + " rotating exit node")
               out.append(ts() + " " + col(GRN, "[ OK ]") + " circuit established, rtt " + str(random.randint(180, 520)) + "ms")
               return out
 
           def boot():
               pool = ["Mounted /dev/ghost0", "Started kernel module void_net", "Loaded intel-feed daemon",
                       "Reached target network-online", "Started shadow-sync.service", "Initialized entropy pool",
-                      "Mounted encrypted volume /vault", "Started watchdog.timer"]
-              out = [ts() + " " + col(GRN, "[ OK ]") + " " + p for p in random.sample(pool, 5)]
-              out.insert(random.randint(1, 4), ts() + " " + col(YEL, "[WARN]") + " entropy low, reseeding")
+                      "Mounted encrypted volume /vault", "Started watchdog.timer", "Loaded firewall ruleset",
+                      "Started mesh-router.service", "Attached /dev/nyx1", "Started log-forwarder",
+                      "Reached target multi-user"]
+              out = [ts() + " " + col(GRN, "[ OK ]") + " " + p for p in random.sample(pool, 8)]
+              out.insert(random.randint(1, 6), ts() + " " + col(YEL, "[WARN]") + " entropy low, reseeding")
               return out
 
           def feedsync():
@@ -134,33 +146,84 @@ jobs:
                   ts() + " " + col(CYN, "[feed]") + " syncing sources... " + str(random.randint(4, 5)) + "/5 reachable",
                   ts() + " " + col(CYN, "[feed]") + " " + str(random.randint(20, 80)) + " headlines cached, " + str(random.randint(2, 15)) + " duplicates dropped",
                   ts() + " " + col(MAG, "[ai]") + " ranking stories by impact score...",
+                  ts() + " " + col(MAG, "[ai]") + " " + str(random.randint(1, 6)) + " candidates above threshold",
+                  ts() + " " + col(MAG, "[ai]") + " cross-checking sources, confidence " + "%.2f" % random.uniform(0.6, 0.98),
                   ts() + " " + col(GRN, "[ OK ]") + " next broadcast window armed",
               ]
 
-          GENS = [(scan, 3), (firewall, 3), (decrypt, 3), (heartbeat, 2), (hexdump, 2), (mesh, 2), (boot, 1), (feedsync, 2)]
-          gen = random.choices([g for g, _ in GENS], weights=[w for _, w in GENS])[0]
-          lines = gen()
-          msg = ("```ansi\n" + "\n".join(lines) + "\n```\n"
-                 "-# simulated telemetry // all hosts fictional (RFC 5737), nothing here is real")
-          payload = {"username": "root@ghost-shell", "content": msg[:1900], "allowed_mentions": {"parse": []}}
+          def auth():
+              out = []
+              for _ in range(random.randint(5, 8)):
+                  user = random.choice(["root", "admin", "deploy", "operator", "guest", "svc_backup"])
+                  if random.random() < 0.65:
+                      out.append(ts() + " " + col(RED, "[auth] FAILED") + " password for " + user + " from " + ip() + " port " + str(random.randint(1024, 65000)))
+                  else:
+                      out.append(ts() + " " + col(GRN, "[auth] ACCEPTED") + " publickey for " + user + " from " + ip())
+              out.append(ts() + " " + col(YEL, "[auth]") + " " + str(random.randint(2, 30)) + " sources banned for 24h")
+              return out
 
-          for i in range(3):
-              try:
-                  req = urllib.request.Request(HOOK, data=json.dumps(payload).encode(),
-                                               headers={"Content-Type": "application/json", "User-Agent": "ghost-logs"})
-                  urllib.request.urlopen(req, timeout=30)
-                  print("posted:", gen.__name__)
-                  break
-              except urllib.error.HTTPError as e:
-                  if e.code in (429, 500, 502, 503) and i < 2:
-                      time.sleep(5 * (i + 1))
-                      continue
-                  sys.exit("Discord webhook error HTTP " + str(e.code))
-              except Exception:
-                  if i < 2:
-                      time.sleep(5)
-                      continue
-                  sys.exit("Cannot reach Discord")
+          def top():
+              procs = ["shadowd", "meshd", "feedsync", "kworker/0:2", "sshd", "watchdog", "entropyd", "logfwd", "cryptsvc", "intel-ai"]
+              out = [ts() + " " + col(CYN, "$") + " top -b -n1 | head", "  PID USER      %CPU %MEM COMMAND"]
+              for name in random.sample(procs, 6):
+                  out.append(str(random.randint(100, 9999)).rjust(5) + " " + random.choice(["root", "ghost", "daemon"]).ljust(9)
+                             + ("%.1f" % random.uniform(0.1, 38)).rjust(5) + " " + ("%.1f" % random.uniform(0.1, 12)).rjust(4) + " " + name)
+              return out
+
+          GENS = [(scan, 3), (firewall, 3), (decrypt, 3), (heartbeat, 2), (hexdump, 2),
+                  (mesh, 2), (boot, 1), (feedsync, 2), (auth, 3), (top, 2)]
+
+          # A "session" glues 2-4 different log types together, so every post is long.
+          k = random.choices([2, 3, 4], weights=[3, 4, 2])[0]
+          pool, chosen = GENS[:], []
+          while len(chosen) < k:
+              g = random.choices([g for g, _ in pool], weights=[w for _, w in pool])[0]
+              chosen.append(g)
+              pool = [(x, w) for x, w in pool if x is not g]
+          lines = []
+          for i, g in enumerate(chosen):
+              if i:
+                  lines.append(col(DIM, "-" * 44))
+              lines += g()
+
+          def chunks(lines, limit=1800):
+              out, cur, size = [], [], 0
+              for l in lines:
+                  if cur and size + len(l) + 1 > limit:
+                      out.append(cur)
+                      cur, size = [], 0
+                  cur.append(l)
+                  size += len(l) + 1
+              if cur:
+                  out.append(cur)
+              return out[:3]          # Discord caps a message at 2000 chars; max 3 messages per run
+
+          def send(payload):
+              for i in range(3):
+                  try:
+                      req = urllib.request.Request(HOOK, data=json.dumps(payload).encode(),
+                                                   headers={"Content-Type": "application/json", "User-Agent": "ghost-logs"})
+                      urllib.request.urlopen(req, timeout=30)
+                      return
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 500, 502, 503) and i < 2:
+                          time.sleep(5 * (i + 1))
+                          continue
+                      sys.exit("Discord webhook error HTTP " + str(e.code))
+                  except Exception:
+                      if i < 2:
+                          time.sleep(5)
+                          continue
+                      sys.exit("Cannot reach Discord")
+
+          parts = chunks(lines)
+          for n, part in enumerate(parts):
+              if n:
+                  time.sleep(1.5)     # stay under the webhook rate limit
+              send({"username": "root@ghost-shell",
+                    "content": "```ansi\n" + "\n".join(part) + "\n```",
+                    "allowed_mentions": {"parse": []}})
+          print("posted", len(parts), "message(s):", ", ".join(g.__name__ for g in chosen))
           PY
 
       - name: Delete old runs of this workflow (keep newest 5)
