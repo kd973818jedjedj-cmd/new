@@ -1,81 +1,81 @@
 {
  "gemini-3.8-flash": {
   "fails": 10,
-  "until": 1795799032,
+  "until": 1795831300,
   "ok": 0,
   "last_error": "HTTP 429 from generativelanguage.googleapis.com: You exceeded your current quota, please check your plan and billing det"
  },
  "gemini-3.7-flash": {
   "fails": 10,
-  "until": 1795799032,
+  "until": 1795831300,
   "ok": 0,
   "last_error": "HTTP 429 from generativelanguage.googleapis.com: You exceeded your current quota, please check your plan and billing det"
  },
  "gemini-3.6-flash": {
   "fails": 10,
-  "until": 1795799032,
+  "until": 1795831300,
   "ok": 0,
   "last_error": "HTTP 429 from generativelanguage.googleapis.com: You exceeded your current quota, please check your plan and billing det"
  },
  "gemini-3.5-flash-lite": {
   "fails": 10,
-  "until": 1795799032,
+  "until": 1795831300,
   "ok": 0,
   "last_error": "HTTP 429 from generativelanguage.googleapis.com: You exceeded your current quota, please check your plan and billing det"
  },
  "gemini-3.1-flash-lite": {
   "fails": 10,
-  "until": 1795799032,
+  "until": 1795831300,
   "ok": 0,
   "last_error": "HTTP 429 from generativelanguage.googleapis.com: You exceeded your current quota, please check your plan and billing det"
  },
  "gemini-3.5-flash": {
   "fails": 10,
-  "until": 1795799032,
+  "until": 1795831300,
   "ok": 0,
   "last_error": "HTTP 429 from generativelanguage.googleapis.com: You exceeded your current quota, please check your plan and billing det"
  },
  "gemini-2.5-flash": {
   "fails": 10,
-  "until": 1795968253,
+  "until": 1796000520,
   "ok": 0,
   "last_error": "HTTP 404 from generativelanguage.googleapis.com: This model models/gemini-2.5-flash is no longer available to new users."
  },
  "gemini-flash-latest": {
   "fails": 10,
-  "until": 1795799032,
+  "until": 1795831300,
   "ok": 0,
   "last_error": "HTTP 429 from generativelanguage.googleapis.com: You exceeded your current quota, please check your plan and billing det"
  },
  "gemini-flash-lite-latest": {
   "fails": 10,
-  "until": 1795799032,
+  "until": 1795831300,
   "ok": 0,
   "last_error": "HTTP 429 from generativelanguage.googleapis.com: You exceeded your current quota, please check your plan and billing det"
  },
  "gemini-2.5-pro": {
   "fails": 10,
-  "until": 1795968253,
+  "until": 1796000521,
   "ok": 0,
   "last_error": "HTTP 404 from generativelanguage.googleapis.com: This model models/gemini-2.5-pro is no longer available to new users. P"
  },
  "gemini-3.8-flash|feeds": {
   "fails": 10,
-  "until": 1795796364,
+  "until": 1795828691,
   "ok": 0,
   "last_error": "HTTP 503 from generativelanguage.googleapis.com: This model is currently experiencing high demand. Spikes in demand are "
  },
  "gemini-3.7-flash|feeds": {
-  "fails": 1,
-  "until": 1795796405,
+  "fails": 2,
+  "until": 1795828700,
   "ok": 1795743017,
   "last_error": "HTTP 503 from generativelanguage.googleapis.com: This model is currently experiencing high demand. Spikes in demand are "
  },
  "gemini-3.6-flash|feeds": {
-  "fails": 2,
-  "until": 1795796483,
-  "ok": 1795656679,
-  "last_error": "HTTP 503 from generativelanguage.googleapis.com: This model is currently experiencing high demand. Spikes in demand are "
+  "fails": 0,
+  "until": 0,
+  "ok": 1795827853,
+  "last_error": ""
  },
  "gemini-3.5-flash-lite|feeds": {
   "fails": 0,
